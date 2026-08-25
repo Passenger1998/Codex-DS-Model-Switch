@@ -4,7 +4,7 @@
 //       /tmp/icon_gen <输出目录>
 //
 // 设计：深色 Codex 风格圆角方形底 + 三色(绿→蓝→紫)圆形切换箭头 + 白色六边形节点。
-// 三种颜色代表三个可切换模型状态（ChatGPT / DeepSeek High / DeepSeek Max）。
+// 三色渐变箭头代表在 ChatGPT 与 DeepSeek V4 Pro 两种 Provider 之间切换。
 
 import AppKit
 import Foundation

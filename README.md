@@ -139,6 +139,8 @@ curl --noproxy '*' -H 'Authorization: Bearer codex-deepseek-local' http://127.0.
 
 构建脚本生成当前 Mac 架构、最低 macOS 13.0 的本地临时签名应用。它先在临时目录编译、运行测试和签名，成功后再替换旧 App。
 
+构建脚本会把 `AppIcon.icns` 打包进 `Contents/Resources/`，为应用提供图标。
+
 ### 安全边界
 
 - 兼容桥拒绝绑定非回环地址。
@@ -158,15 +160,18 @@ curl --noproxy '*' -H 'Authorization: Bearer codex-deepseek-local' http://127.0.
 ├── build.sh                       # 构建 + 单元测试 + ad-hoc 签名
 ├── install.sh                     # 一键安装 / 修复
 ├── verify.sh                      # 本地端到端验证
+├── AppIcon-preview.png            # 应用图标预览
 ├── Sources/CodexModelSwitcher/
 │   ├── main.swift                 # GUI 与命令行入口
 │   ├── ConfigEditor.swift         # config.toml 最小化安全编辑
 │   ├── CodexAppRestarter.swift    # 退出并重新打开 Codex
+│   ├── AppIcon.icns               # 应用图标（构建时打包进 .app）
 │   └── Info.plist                 # v1.5.0 / macOS 13.0+
 ├── Support/
 │   ├── deepseek_responses_proxy.py  # Responses → Chat Completions 兼容桥
 │   ├── codex-provider               # 安全切换命令
 │   ├── install_config.py            # config.toml / LaunchAgent 写入
+│   ├── generate_app_icon.swift      # 生成 AppIcon.icns 与预览图
 │   └── deepseek.models.json         # 专用模型目录
 └── Tests/
     ├── ConfigEditorTests.swift
@@ -310,6 +315,8 @@ curl --noproxy '*' -H 'Authorization: Bearer codex-deepseek-local' http://127.0.
 
 The build script produces an ad-hoc signed app for the current Mac architecture targeting macOS 13.0 or newer. It compiles, runs the tests, and signs in a temporary directory first, then replaces the old app only on success.
 
+The build script bundles `AppIcon.icns` into `Contents/Resources/` so the app ships with an icon.
+
 ### Security boundaries
 
 - The bridge refuses to bind to non-loopback addresses.
@@ -329,15 +336,18 @@ The build script produces an ad-hoc signed app for the current Mac architecture 
 ├── build.sh                       # Build + unit tests + ad-hoc signing
 ├── install.sh                     # One-shot install / repair
 ├── verify.sh                      # Local end-to-end verification
+├── AppIcon-preview.png            # App icon preview
 ├── Sources/CodexModelSwitcher/
 │   ├── main.swift                 # GUI and CLI entry point
 │   ├── ConfigEditor.swift         # Minimal safe config.toml editing
 │   ├── CodexAppRestarter.swift    # Quit and relaunch Codex
+│   ├── AppIcon.icns               # App icon (bundled into .app at build time)
 │   └── Info.plist                 # v1.5.0 / macOS 13.0+
 ├── Support/
 │   ├── deepseek_responses_proxy.py  # Responses → Chat Completions bridge
 │   ├── codex-provider               # Safe switch command
 │   ├── install_config.py            # config.toml / LaunchAgent writer
+│   ├── generate_app_icon.swift      # Generates AppIcon.icns and preview
 │   └── deepseek.models.json         # Dedicated model catalog
 └── Tests/
     ├── ConfigEditorTests.swift
