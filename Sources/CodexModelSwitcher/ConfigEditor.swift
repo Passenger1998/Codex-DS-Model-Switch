@@ -15,17 +15,14 @@ func resolvedCodexDirectory(
 
 enum CodexMode: String {
     case chatGPT = "chatgpt"
-    case deepSeekHigh = "deepseek-high"
-    case deepSeekMax = "deepseek-max"
+    case deepSeek = "deepseek"
 
     var displayName: String {
         switch self {
         case .chatGPT:
             return "ChatGPT"
-        case .deepSeekHigh:
-            return "DeepSeek V4 Pro · High"
-        case .deepSeekMax:
-            return "DeepSeek V4 Pro · Max"
+        case .deepSeek:
+            return "DeepSeek V4 Pro"
         }
     }
 }

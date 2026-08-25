@@ -43,15 +43,12 @@ struct ConfigEditorTests {
             executableURL: executable
         )
 
-        let deepSeekHighResult = try command.switchMode(to: .deepSeekHigh)
-        let deepSeekMaxResult = try command.switchMode(to: .deepSeekMax)
+        let deepSeekResult = try command.switchMode(to: .deepSeek)
         let chatGPTResult = try command.switchMode(to: .chatGPT)
         let statusResult = try command.status()
 
-        try expect(deepSeekHighResult.output == "mode=deepseek-high",
-                   "DeepSeek High 参数传递错误")
-        try expect(deepSeekMaxResult.output == "mode=deepseek-max",
-                   "DeepSeek Max 参数传递错误")
+        try expect(deepSeekResult.output == "mode=deepseek",
+                   "DeepSeek 参数传递错误")
         try expect(chatGPTResult.output == "mode=chatgpt",
                    "ChatGPT 参数传递错误")
         try expect(statusResult.output == "mode=status",
@@ -59,14 +56,9 @@ struct ConfigEditorTests {
     }
 
     static func testActualStatusParsing() throws {
-        let high = ProviderStatus(output: """
-        current_state=deepseek-high
-        state_label=DeepSeek V4 Pro · High
-        state_consistent=yes
-        """)
-        let max = ProviderStatus(output: """
-        current_state=deepseek-max
-        state_label=DeepSeek V4 Pro · Max
+        let deepSeek = ProviderStatus(output: """
+        current_state=deepseek
+        state_label=DeepSeek V4 Pro
         state_consistent=yes
         """)
         let inconsistent = ProviderStatus(output: """
@@ -75,11 +67,9 @@ struct ConfigEditorTests {
         state_consistent=no
         """)
 
-        try expect(high.currentMode == .deepSeekHigh, "High 实际状态解析错误")
-        try expect(high.displayName == "DeepSeek V4 Pro · High", "High 显示状态错误")
-        try expect(high.isConsistent, "High 应标记为一致")
-        try expect(max.currentMode == .deepSeekMax, "Max 实际状态解析错误")
-        try expect(max.isConsistent, "Max 应标记为一致")
+        try expect(deepSeek.currentMode == .deepSeek, "DeepSeek 实际状态解析错误")
+        try expect(deepSeek.displayName == "DeepSeek V4 Pro", "DeepSeek 显示状态错误")
+        try expect(deepSeek.isConsistent, "DeepSeek 应标记为一致")
         try expect(inconsistent.currentMode == nil, "不一致状态不应映射为可选模式")
         try expect(!inconsistent.isConsistent, "不一致状态应被识别")
     }

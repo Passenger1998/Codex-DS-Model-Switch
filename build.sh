@@ -81,6 +81,8 @@ swiftc -swift-version 5 -O \
   "$ROOT_DIR/Sources/CodexModelSwitcher/main.swift"
 
 cp "$ROOT_DIR/Sources/CodexModelSwitcher/Info.plist" "$CONTENTS_DIR/Info.plist"
+mkdir -p "$CONTENTS_DIR/Resources"
+cp "$ROOT_DIR/Sources/CodexModelSwitcher/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
 printf 'APPL????' > "$CONTENTS_DIR/PkgInfo"
 
 xattr -cr "$STAGED_APP_DIR"

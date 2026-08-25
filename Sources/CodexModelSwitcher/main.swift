@@ -11,7 +11,7 @@ let commandLineArguments = Array(CommandLine.arguments.dropFirst())
 
 if !commandLineArguments.isEmpty {
     guard commandLineArguments.count == 1 else {
-        printToStandardError("Usage: CodexModelSwitcher {chatgpt|deepseek-high|deepseek-max|deepseek|status}")
+        printToStandardError("Usage: CodexModelSwitcher {chatgpt|deepseek|status}")
         exit(2)
     }
 
@@ -20,14 +20,12 @@ if !commandLineArguments.isEmpty {
         switch commandLineArguments[0] {
         case "chatgpt":
             result = try providerCommand.switchMode(to: .chatGPT)
-        case "deepseek", "deepseek-high":
-            result = try providerCommand.switchMode(to: .deepSeekHigh)
-        case "deepseek-max":
-            result = try providerCommand.switchMode(to: .deepSeekMax)
+        case "deepseek":
+            result = try providerCommand.switchMode(to: .deepSeek)
         case "status":
             result = try providerCommand.status()
         default:
-            printToStandardError("Usage: CodexModelSwitcher {chatgpt|deepseek-high|deepseek-max|deepseek|status}")
+            printToStandardError("Usage: CodexModelSwitcher {chatgpt|deepseek|status}")
             exit(2)
         }
         print(result.output)
@@ -74,19 +72,16 @@ func chooseTarget(currentStatus: ProviderStatus) -> CodexMode? {
     alert.alertStyle = .informational
     alert.messageText = "Codex 模型切换器"
     let consistencyNote = currentStatus.isConsistent ? "" : "（Codex 配置与 proxy 参数不一致）"
-    alert.informativeText = "当前实际状态：\(currentStatus.displayName)\(consistencyNote)\n\n选择新任务要使用的状态。切换成功并通过健康检查后会自动退出并重新打开 Codex，正在执行的任务会被中断。每次切换前都会备份 config.toml 和 LaunchAgent。"
+    alert.informativeText = "当前实际状态：\(currentStatus.displayName)\(consistencyNote)\n\n选择新任务要使用的 Provider。切换成功并通过健康检查后会自动退出并重新打开 Codex，正在执行的任务会被中断。每次切换前都会备份 config.toml。\n\n推理强度请直接在 Codex 中选择：高 = High，极高 = Max。"
     alert.addButton(withTitle: "ChatGPT")
-    alert.addButton(withTitle: "DeepSeek V4 Pro · High")
-    alert.addButton(withTitle: "DeepSeek V4 Pro · Max")
+    alert.addButton(withTitle: "DeepSeek V4 Pro")
     alert.addButton(withTitle: "取消")
 
     switch alert.runModal() {
     case .alertFirstButtonReturn:
         return .chatGPT
     case .alertSecondButtonReturn:
-        return .deepSeekHigh
-    case .alertThirdButtonReturn:
-        return .deepSeekMax
+        return .deepSeek
     default:
         return nil
     }

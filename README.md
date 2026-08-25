@@ -1,12 +1,12 @@
 # Codex 模型切换器 / Codex Model Switcher
 
-一个可双击运行的 macOS 小工具，用于在 **ChatGPT**、**DeepSeek V4 Pro · High** 与 **DeepSeek V4 Pro · Max** 三种实际状态之间安全切换。配置切换成功并通过健康检查后会自动退出并重新打开 Codex。
+一个可双击运行的 macOS 小工具，用于在 **ChatGPT** 与 **DeepSeek V4 Pro** 两种实际 Provider 之间安全切换。推理强度不再由切换器管理，而是完全跟随 Codex 每个会话自身的「推理强度」设置。配置切换成功并通过健康检查后会自动退出并重新打开 Codex。
 
-A double-clickable macOS utility that safely switches Codex between three real states: **ChatGPT**, **DeepSeek V4 Pro · High**, and **DeepSeek V4 Pro · Max**. After a successful switch and health check it automatically quits and reopens Codex.
+A double-clickable macOS utility that safely switches Codex between two real providers: **ChatGPT** and **DeepSeek V4 Pro**. Reasoning effort is no longer managed by the switcher; it fully follows each Codex session's own reasoning-effort setting. After a successful switch and health check it automatically quits and reopens Codex.
 
 - 版本 / Version：**1.5.0（build 8）**
 - 最低系统 / Minimum OS：**macOS 13.0**
-- 兼容桥 / Compatibility bridge：`Support/deepseek_responses_proxy.py` **v1.1.4**
+- 兼容桥 / Compatibility bridge：`Support/deepseek_responses_proxy.py` **v1.1.5**
 
 ---
 
@@ -76,10 +76,10 @@ security add-generic-password -s codex-deepseek-api-key -a deepseek -w sk-你的
 
 ### 使用
 
-1. 双击 `Codex 模型切换器.app`（或命令行执行 `Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher {chatgpt|deepseek-high|deepseek-max|deepseek|status}`）。
-2. 选择 `ChatGPT`、`DeepSeek V4 Pro · High` 或 `DeepSeek V4 Pro · Max`。
-3. 界面显示的当前状态来自 Codex 配置、LaunchAgent plist 与 proxy 实际运行参数，不使用“上次点击”记录；状态不一致时会明确提示。
-4. DeepSeek 模式会同步更新 Codex reasoning effort 和 proxy 启动参数，重载 proxy，并检查本地状态与 `/upstream-health` 后再提交配置。
+1. 双击 `Codex 模型切换器.app`（或命令行执行 `Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher {chatgpt|deepseek|status}`）。
+2. 选择 `ChatGPT` 或 `DeepSeek V4 Pro`。**推理强度请直接在 Codex 中选择：高 = High，极高 = Max。**
+3. 界面显示的当前状态来自 Codex 配置与 proxy 实际健康状态，不使用“上次点击”记录；状态不一致时会明确提示。
+4. DeepSeek 模式只切换 Provider/模型并检查 `/upstream-health`，不再修改或重载 proxy 的推理档位；同一个 proxy 进程会按每次请求动态映射 High / Max。
 5. 配置切换成功后，切换器会正常退出 Codex，等待退出后重新打开它。
 6. 如果 Codex 未响应正常退出请求，切换器会在等待 8 秒后强制退出；正在执行的任务会被中断。
 
@@ -92,14 +92,13 @@ DeepSeek 模式只激活以下顶层字段：
 ```toml
 model = "deepseek-v4-pro"
 model_provider = "deepseek"
-model_reasoning_effort = "high" # Max 档使用 Codex 支持的 "xhigh"
 model_catalog_json = "/Users/你的用户名/.codex/deepseek.models.json"
 ```
 
 - DeepSeek 模式不携带 ChatGPT/OpenAI 的 `service_tier`。
-- High 和 Max 都保持 `thinking = enabled`。High 使用 Codex `high` → DeepSeek `high`；Max 使用 Codex `xhigh` → 兼容桥明确翻译为 DeepSeek 上游 `max`。这是因为当前 Codex 配置枚举不接受 `max`，状态输出会同时显示传输档和上游有效档。
-- 已存在的 DeepSeek High 任务会保留任务级 `high`。当全局切到 Max 后重新打开这类任务，Max proxy 会把该旧任务的 `high` 明确翻译为上游 `max`，并在 `/health` 的 `last_request_reasoning_effort_translation` 中显示 `high->max`。反方向不允许：High proxy 收到 `xhigh` 仍会失败，避免静默降档。
-- 每次切换到 Max 时，切换器还会要求 proxy 健康端点声明 `accepted_codex_reasoning_efforts=["high","xhigh"]`；不满足时切换失败并回滚，不会显示成功。
+- proxy 始终 `thinking = enabled`，且不再有全局 `--reasoning-effort`。兼容桥把每个 Codex 请求中的 `reasoning.effort` 作为唯一档位来源逐请求映射：`high` → DeepSeek `high`，`xhigh` → DeepSeek `max`；请求未携带档位时回落到默认 `high`。
+- 同一 proxy 进程同时支持不同会话使用不同档位，且同一会话在 High / Max 之间切换立即生效，无需重启 proxy 或切换器。
+- `/health` 与 `/upstream-health` 会报告 `reasoning_effort="dynamic"`、`accepted_codex_reasoning_efforts=["high","xhigh"]` 与 `reasoning_effort_mapping={"high":"high","xhigh":"max"}`。
 - ChatGPT 模式恢复 `~/.codex/chatgpt.activation.toml` 保存的 OpenAI 偏好。
 - Provider、Keychain、LaunchAgent 和专用 model catalog 永久保留。
 - plugins、MCP、projects、desktop、权限及其他配置保持不变。
@@ -248,10 +247,10 @@ security add-generic-password -s codex-deepseek-api-key -a deepseek -w sk-your-k
 
 ### Usage
 
-1. Double-click `Codex 模型切换器.app` (or run `Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher {chatgpt|deepseek-high|deepseek-max|deepseek|status}` from the command line).
-2. Choose `ChatGPT`, `DeepSeek V4 Pro · High`, or `DeepSeek V4 Pro · Max`.
-3. The current state shown in the UI is derived from the Codex configuration, the LaunchAgent plist, and the proxy's actual runtime parameters — not from the last click. Inconsistent states are flagged explicitly.
-4. DeepSeek mode updates the Codex reasoning effort and proxy startup arguments together, reloads the proxy, and checks the local `/health` and `/upstream-health` endpoints before committing the configuration.
+1. Double-click `Codex 模型切换器.app` (or run `Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher {chatgpt|deepseek|status}` from the command line).
+2. Choose `ChatGPT` or `DeepSeek V4 Pro`. **Choose the reasoning effort directly in Codex: high = High, xhigh = Max.**
+3. The current state shown in the UI is derived from the Codex configuration and the proxy's actual health — not from the last click. Inconsistent states are flagged explicitly.
+4. DeepSeek mode only switches the provider/model and checks `/upstream-health`; it no longer modifies or reloads the proxy's reasoning tier. A single proxy process maps High / Max per request.
 5. After a successful switch, the switcher quits Codex gracefully, waits for it to exit, and reopens it.
 6. If Codex does not respond to a graceful quit, the switcher force-quits it after 8 seconds; running tasks will be interrupted.
 
@@ -264,14 +263,13 @@ DeepSeek mode only activates these top-level fields:
 ```toml
 model = "deepseek-v4-pro"
 model_provider = "deepseek"
-model_reasoning_effort = "high" # Max uses Codex-supported "xhigh"
 model_catalog_json = "/Users/your-user/.codex/deepseek.models.json"
 ```
 
 - DeepSeek mode never carries the ChatGPT/OpenAI `service_tier`.
-- High and Max both keep `thinking = enabled`. High uses Codex `high` → DeepSeek `high`; Max uses Codex `xhigh`, which the compatibility bridge explicitly translates to the DeepSeek upstream `max`. The current Codex config enum does not accept `max`, so status output shows both the transport tier and the effective upstream tier.
-- Existing DeepSeek High tasks keep their task-level `high`. When the global mode switches to Max and such tasks are reopened, the Max proxy explicitly translates that legacy `high` to upstream `max`, shown as `high->max` in `/health`'s `last_request_reasoning_effort_translation`. The reverse direction is not allowed: the High proxy still fails on `xhigh` to avoid a silent downgrade.
-- On every switch to Max, the switcher requires the proxy health endpoint to declare `accepted_codex_reasoning_efforts=["high","xhigh"]`; otherwise the switch fails and rolls back without reporting success.
+- The proxy always keeps `thinking = enabled` and no longer has a global `--reasoning-effort`. The bridge treats each Codex request's `reasoning.effort` as the single source of truth and maps it per request: `high` → DeepSeek `high`, `xhigh` → DeepSeek `max`; requests without an effort fall back to the default `high`.
+- A single proxy process simultaneously supports different sessions using different tiers, and a session can switch between High / Max instantly without restarting the proxy or the switcher.
+- `/health` and `/upstream-health` report `reasoning_effort="dynamic"`, `accepted_codex_reasoning_efforts=["high","xhigh"]`, and `reasoning_effort_mapping={"high":"high","xhigh":"max"}`.
 - ChatGPT mode restores the OpenAI preferences saved in `~/.codex/chatgpt.activation.toml`.
 - The provider, Keychain entry, LaunchAgent, and dedicated model catalog are kept permanently.
 - Plugins, MCP servers, projects, desktop settings, permissions, and other configuration stay untouched.

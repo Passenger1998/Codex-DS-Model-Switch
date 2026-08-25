@@ -8,6 +8,8 @@
     <string>CodexModelSwitcher</string>
     <key>CFBundleIdentifier</key>
     <string>local.codex-model-switcher</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

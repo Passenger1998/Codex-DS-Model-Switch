@@ -100,30 +100,7 @@ def patch_config(config_path: Path, chatgpt_state_path: Path) -> None:
     atomic_write(config_path, patched.encode("utf-8"), 0o600)
 
 
-def configured_reasoning_effort(config_path: Path, launch_agent_path: Path) -> str:
-    if config_path.exists():
-        text = config_path.read_text(encoding="utf-8")
-        provider_match = re.search(r'^\s*model_provider\s*=\s*"([^"]+)"', text, re.MULTILINE)
-        effort_match = re.search(r'^\s*model_reasoning_effort\s*=\s*"([^"]+)"', text, re.MULTILINE)
-        if provider_match and provider_match.group(1) == "deepseek" and effort_match:
-            if effort_match.group(1) == "high":
-                return "high"
-            if effort_match.group(1) in {"xhigh", "max"}:
-                return "max"
-    if launch_agent_path.exists():
-        try:
-            payload = plistlib.loads(launch_agent_path.read_bytes())
-            arguments = payload.get("ProgramArguments") or []
-            index = arguments.index("--reasoning-effort")
-            effort = str(arguments[index + 1])
-            if effort in {"high", "max"}:
-                return effort
-        except (IndexError, OSError, ValueError, plistlib.InvalidFileException):
-            pass
-    return "high"
-
-
-def write_launch_agent(path: Path, proxy_path: Path, log_dir: Path, reasoning_effort: str) -> None:
+def write_launch_agent(path: Path, proxy_path: Path, log_dir: Path) -> None:
     payload = {
         "Label": "local.codex-deepseek-proxy",
         "ProgramArguments": [
@@ -134,7 +111,6 @@ def write_launch_agent(path: Path, proxy_path: Path, log_dir: Path, reasoning_ef
             "--keychain-service", "codex-deepseek-api-key",
             "--local-token", "codex-deepseek-local",
             "--thinking", "enabled",
-            "--reasoning-effort", reasoning_effort,
             "--connect-timeout", "8",
             "--stream-idle-timeout", "180",
             "--response-timeout", "300",
@@ -162,13 +138,11 @@ def main() -> None:
     log_dir = codex_home / "log"
     log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     config_path = codex_home / "config.toml"
-    effort = configured_reasoning_effort(config_path, launch_agent_path)
     patch_config(config_path, codex_home / "chatgpt.activation.toml")
     write_launch_agent(
         launch_agent_path,
         codex_home / "deepseek-proxy" / "proxy.py",
         log_dir,
-        effort,
     )
 
 

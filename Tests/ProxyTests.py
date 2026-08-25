@@ -310,13 +310,17 @@ class ProxyIntegrationTests(unittest.TestCase):
             health = json.load(response)
         self.assertEqual(health["status"], "ok")
         self.assertEqual(health["thinking"], "enabled")
-        self.assertEqual(health["reasoning_effort"], "high")
-        self.assertEqual(health["codex_reasoning_effort"], "high")
-        self.assertEqual(health["upstream_reasoning_effort"], "high")
-        self.assertEqual(health["accepted_codex_reasoning_efforts"], ["high"])
-        self.assertIn(health["last_request_codex_reasoning_effort"], {None, "high"})
-        self.assertIn(health["last_request_upstream_reasoning_effort"], {None, "high"})
-        self.assertIn(health["last_request_reasoning_effort_translation"], {None, "high->high"})
+        self.assertEqual(health["reasoning_effort"], "dynamic")
+        self.assertEqual(health["codex_reasoning_effort"], "high|xhigh")
+        self.assertEqual(health["upstream_reasoning_effort"], "dynamic")
+        self.assertEqual(health["accepted_codex_reasoning_efforts"], ["high", "xhigh"])
+        self.assertEqual(health["reasoning_effort_mapping"], {"high": "high", "xhigh": "max"})
+        self.assertIn(health["last_request_codex_reasoning_effort"], {None, "high", "xhigh"})
+        self.assertIn(health["last_request_upstream_reasoning_effort"], {None, "high", "max"})
+        self.assertIn(
+            health["last_request_reasoning_effort_translation"],
+            {None, "default->high", "high->high", "xhigh->max"},
+        )
         self.assertIn(health["network_route"], {"direct connection", "macOS HTTP system proxy", "macOS HTTPS system proxy"})
         status, text = self.request({"model": "deepseek-v4-pro", "input": "hello"}, token="wrong")
         self.assertEqual(status, 401)
@@ -329,10 +333,11 @@ class ProxyIntegrationTests(unittest.TestCase):
             upstream_health = json.load(response)
         self.assertEqual(upstream_health["status"], "ok")
         self.assertIn("deepseek-v4-pro", upstream_health["models"])
-        self.assertEqual(upstream_health["reasoning_effort"], "high")
-        self.assertEqual(upstream_health["codex_reasoning_effort"], "high")
-        self.assertEqual(upstream_health["upstream_reasoning_effort"], "high")
-        self.assertEqual(upstream_health["accepted_codex_reasoning_efforts"], ["high"])
+        self.assertEqual(upstream_health["reasoning_effort"], "dynamic")
+        self.assertEqual(upstream_health["codex_reasoning_effort"], "high|xhigh")
+        self.assertEqual(upstream_health["upstream_reasoning_effort"], "dynamic")
+        self.assertEqual(upstream_health["accepted_codex_reasoning_efforts"], ["high", "xhigh"])
+        self.assertEqual(upstream_health["reasoning_effort_mapping"], {"high": "high", "xhigh": "max"})
 
     def test_macos_system_proxy_parsing_and_loopback_bypass(self) -> None:
         settings = PROXY_MODULE.parse_macos_proxy_settings(
@@ -387,7 +392,7 @@ class ProxyIntegrationTests(unittest.TestCase):
             transport.open(request, read_timeout=1)
         self.assertLess(time.monotonic() - started, 1)
 
-    def test_proxy_effort_is_authoritative_and_mismatch_fails(self) -> None:
+    def test_proxy_maps_codex_effort_per_request(self) -> None:
         config = PROXY_MODULE.ProxyConfig(
             host="127.0.0.1",
             port=4878,
@@ -395,7 +400,6 @@ class ProxyIntegrationTests(unittest.TestCase):
             keychain_service="test",
             local_token=TOKEN,
             thinking="enabled",
-            reasoning_effort="max",
             connect_timeout=1,
             stream_idle_timeout=2,
             response_timeout=3,
@@ -410,23 +414,28 @@ class ProxyIntegrationTests(unittest.TestCase):
         self.assertEqual(adapter.last_codex_reasoning_effort, "xhigh")
         self.assertEqual(adapter.last_upstream_reasoning_effort, "max")
         self.assertEqual(adapter.last_reasoning_effort_translation, "xhigh->max")
-        self.assertEqual(PROXY_MODULE.accepted_codex_efforts("max"), ["high", "xhigh"])
-        self.assertEqual(PROXY_MODULE.accepted_codex_efforts("high"), ["high"])
 
-        legacy_payload, _, _ = adapter.payload(
-            {"model": "deepseek-v4-pro", "reasoning": {"effort": "high"}, "input": "legacy thread"}
+        payload, _, _ = adapter.payload(
+            {"model": "deepseek-v4-pro", "reasoning": {"effort": "high"}, "input": "hello"}
         )
-        self.assertEqual(legacy_payload["reasoning_effort"], "max")
+        self.assertEqual(payload["reasoning_effort"], "high")
         self.assertEqual(adapter.last_codex_reasoning_effort, "high")
-        self.assertEqual(adapter.last_upstream_reasoning_effort, "max")
-        self.assertEqual(adapter.last_reasoning_effort_translation, "high->max")
+        self.assertEqual(adapter.last_upstream_reasoning_effort, "high")
+        self.assertEqual(adapter.last_reasoning_effort_translation, "high->high")
 
-        high_config = PROXY_MODULE.ProxyConfig(**{**vars(config), "reasoning_effort": "high"})
-        high_adapter = PROXY_MODULE.DeepSeekAdapter(high_config, PROXY_MODULE.CredentialProvider("test"))
-        with self.assertRaisesRegex(RuntimeError, "Reasoning effort mismatch"):
-            high_adapter.payload(
-                {"model": "deepseek-v4-pro", "reasoning": {"effort": "xhigh"}, "input": "hello"}
-            )
+        # Back to Max on the same adapter, without restart or global state.
+        payload, _, _ = adapter.payload(
+            {"model": "deepseek-v4-pro", "reasoning": {"effort": "xhigh"}, "input": "hello"}
+        )
+        self.assertEqual(payload["reasoning_effort"], "max")
+
+        # No effort supplied falls back to the catalog default (high).
+        payload, _, _ = adapter.payload({"model": "deepseek-v4-pro", "input": "hello"})
+        self.assertEqual(payload["reasoning_effort"], "high")
+        self.assertEqual(adapter.last_reasoning_effort_translation, "default->high")
+
+        self.assertEqual(PROXY_MODULE.ACCEPTED_CODEX_EFFORTS, ["high", "xhigh"])
+        self.assertEqual(PROXY_MODULE.CODEX_EFFORT_TO_UPSTREAM, {"high": "high", "xhigh": "max"})
 
     def test_catalog_uses_codex_supported_effort_for_deepseek_max(self) -> None:
         catalog = json.loads((ROOT / "Support" / "deepseek.models.json").read_text(encoding="utf-8"))
@@ -456,6 +465,34 @@ class ProxyIntegrationTests(unittest.TestCase):
         self.assertEqual(upstream["reasoning_effort"], "high")
         self.assertTrue(upstream["stream"])
         self.assertEqual(upstream["stream_options"], {"include_usage": True})
+
+    def test_per_request_effort_mapping_and_concurrent_windows(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        start = len(MockDeepSeekHandler.requests)
+
+        status, _ = self.request({"model": "deepseek-v4-pro", "input": "hi", "reasoning": {"effort": "high"}})
+        self.assertEqual(status, 200)
+        status, _ = self.request({"model": "deepseek-v4-pro", "input": "hi", "reasoning": {"effort": "xhigh"}})
+        self.assertEqual(status, 200)
+        status, _ = self.request({"model": "deepseek-v4-pro", "input": "hi", "reasoning": {"effort": "high"}})
+        self.assertEqual(status, 200)
+
+        sequential = [r.get("reasoning_effort") for r in MockDeepSeekHandler.requests[start:]]
+        self.assertEqual(sequential, ["high", "max", "high"])
+
+        # Two windows with different efforts share the same proxy process.
+        efforts = ["high", "xhigh", "high", "xhigh"]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            codes = list(pool.map(
+                lambda effort: self.request(
+                    {"model": "deepseek-v4-pro", "input": "hi", "reasoning": {"effort": effort}}
+                )[0],
+                efforts,
+            ))
+        self.assertEqual(codes, [200, 200, 200, 200])
+        concurrent = [r.get("reasoning_effort") for r in MockDeepSeekHandler.requests[start + 3:]]
+        self.assertEqual(sorted(concurrent), ["high", "high", "max", "max"])
 
     def test_tool_call_and_reasoning_replay(self) -> None:
         long_name = "mcp__workspace__read_file_with_a_name_that_is_longer_than_sixty_four_characters"
@@ -660,7 +697,6 @@ refresh_interval_ms = 0
                 str(PROXY),
                 "--port", str(max_proxy_port),
                 "--local-token", TOKEN,
-                "--reasoning-effort", "max",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,

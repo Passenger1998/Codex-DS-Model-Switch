@@ -31,7 +31,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4878
 DEFAULT_UPSTREAM = "https://api.deepseek.com/chat/completions"
@@ -43,14 +43,16 @@ TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
-def codex_transport_effort(upstream_effort: str) -> str:
-    return "xhigh" if upstream_effort == "max" else "high"
+# Codex `reasoning.effort` is the single source of truth for each request.
+# Map it to the DeepSeek V4 Pro upstream effort per request, never a fixed
+# global proxy state. Codex exposes "high" and "xhigh" only.
+CODEX_EFFORT_TO_UPSTREAM = {"high": "high", "xhigh": "max"}
+DEFAULT_UPSTREAM_EFFORT = "high"
+ACCEPTED_CODEX_EFFORTS = ["high", "xhigh"]
 
 
-def accepted_codex_efforts(upstream_effort: str) -> list[str]:
-    # Existing desktop threads can retain their creation-time High selection.
-    # A Max proxy must accept both that legacy value and new-thread xhigh.
-    return ["high", "xhigh"] if upstream_effort == "max" else ["high"]
+def upstream_effort_for(codex_effort: str | None) -> str:
+    return CODEX_EFFORT_TO_UPSTREAM.get(codex_effort, DEFAULT_UPSTREAM_EFFORT)
 
 
 def new_id(prefix: str) -> str:
@@ -143,7 +145,6 @@ class ProxyConfig:
     keychain_service: str
     local_token: str
     thinking: str
-    reasoning_effort: str
     connect_timeout: float
     stream_idle_timeout: float
     response_timeout: float
@@ -584,19 +585,12 @@ class DeepSeekAdapter:
         if self.config.thinking == "enabled":
             requested_effort = body.get("reasoning", {}).get("effort") if isinstance(body.get("reasoning"), dict) else None
             requested_text = str(requested_effort) if requested_effort is not None else None
-            configured = "max" if self.config.reasoning_effort == "max" else "high"
-            accepted = set(accepted_codex_efforts(configured)) | ({"max", "ultra"} if configured == "max" else set())
-            if requested_text is not None and requested_text not in accepted:
-                raise RuntimeError(
-                    "Reasoning effort mismatch: "
-                    f"Codex requested {requested_effort}, proxy expects "
-                    f"{codex_transport_effort(configured)} for DeepSeek upstream {configured}"
-                )
-            payload["reasoning_effort"] = configured
+            upstream_effort = upstream_effort_for(requested_text)
+            payload["reasoning_effort"] = upstream_effort
             self.last_codex_reasoning_effort = requested_text
-            self.last_upstream_reasoning_effort = configured
+            self.last_upstream_reasoning_effort = upstream_effort
             self.last_reasoning_effort_translation = (
-                f"{requested_text}->{configured}" if requested_text is not None else f"default->{configured}"
+                f"{requested_text}->{upstream_effort}" if requested_text is not None else f"default->{upstream_effort}"
             )
         if tools:
             payload["tools"] = tools
@@ -787,10 +781,11 @@ class DeepSeekAdapter:
             "elapsed_ms": int((time.monotonic() - started) * 1000),
             "network_route": self.transport.route_name,
             "thinking": self.config.thinking,
-            "reasoning_effort": self.config.reasoning_effort,
-            "codex_reasoning_effort": codex_transport_effort(self.config.reasoning_effort),
-            "upstream_reasoning_effort": self.config.reasoning_effort,
-            "accepted_codex_reasoning_efforts": accepted_codex_efforts(self.config.reasoning_effort),
+            "reasoning_effort": "dynamic",
+            "codex_reasoning_effort": "high|xhigh",
+            "upstream_reasoning_effort": "dynamic",
+            "accepted_codex_reasoning_efforts": ACCEPTED_CODEX_EFFORTS,
+            "reasoning_effort_mapping": CODEX_EFFORT_TO_UPSTREAM,
             "last_request_codex_reasoning_effort": self.last_codex_reasoning_effort,
             "last_request_upstream_reasoning_effort": self.last_upstream_reasoning_effort,
             "last_request_reasoning_effort_translation": self.last_reasoning_effort_translation,
@@ -911,10 +906,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "version": VERSION,
                     "thinking": self.app.config.thinking,
-                    "reasoning_effort": self.app.config.reasoning_effort,
-                    "codex_reasoning_effort": codex_transport_effort(self.app.config.reasoning_effort),
-                    "upstream_reasoning_effort": self.app.config.reasoning_effort,
-                    "accepted_codex_reasoning_efforts": accepted_codex_efforts(self.app.config.reasoning_effort),
+                    "reasoning_effort": "dynamic",
+                    "codex_reasoning_effort": "high|xhigh",
+                    "upstream_reasoning_effort": "dynamic",
+                    "accepted_codex_reasoning_efforts": ACCEPTED_CODEX_EFFORTS,
+                    "reasoning_effort_mapping": CODEX_EFFORT_TO_UPSTREAM,
                     "last_request_codex_reasoning_effort": self.app.adapter.last_codex_reasoning_effort,
                     "last_request_upstream_reasoning_effort": self.app.adapter.last_upstream_reasoning_effort,
                     "last_request_reasoning_effort_translation": self.app.adapter.last_reasoning_effort_translation,
@@ -1101,11 +1097,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--local-token", default=os.environ.get("CODEX_DEEPSEEK_LOCAL_TOKEN", DEFAULT_LOCAL_TOKEN))
     parser.add_argument("--thinking", choices=("enabled", "disabled"), default=os.environ.get("DEEPSEEK_THINKING", "enabled"))
     parser.add_argument(
-        "--reasoning-effort",
-        choices=("high", "max"),
-        default=os.environ.get("DEEPSEEK_REASONING_EFFORT", "high"),
-    )
-    parser.add_argument(
         "--connect-timeout",
         type=float,
         default=float(os.environ.get("DEEPSEEK_CONNECT_TIMEOUT", "8")),
@@ -1150,7 +1141,6 @@ def main(argv: list[str] | None = None) -> int:
         keychain_service=args.keychain_service,
         local_token=args.local_token,
         thinking=args.thinking,
-        reasoning_effort=args.reasoning_effort,
         connect_timeout=args.connect_timeout,
         stream_idle_timeout=args.stream_idle_timeout,
         response_timeout=args.response_timeout,
@@ -1166,7 +1156,7 @@ def main(argv: list[str] | None = None) -> int:
     server = ProxyServer(config)
     print(
         f"codex-deepseek-proxy {VERSION} listening on http://{config.host}:{config.port} "
-        f"(thinking={config.thinking}, reasoning_effort={config.reasoning_effort}, "
+        f"(thinking={config.thinking}, reasoning_effort=dynamic, "
         f"network={server.adapter.transport.route_name}, connect_timeout={config.connect_timeout:g}s, "
         f"stream_idle_timeout={config.stream_idle_timeout:g}s)",
         file=sys.stderr,
