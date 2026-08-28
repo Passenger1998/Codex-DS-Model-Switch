@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""Unit tests for the Claude Desktop provider manager (Support/claude-provider).
-
-These tests exercise the manager in-process against temporary ``~/.claude``
-and temporary Claude Application-Support directories.  The real macOS
-Keychain, the real Claude Desktop and the real Claude Code binary are never
-used: detection and keychain functions are stubbed, and no model is called.
-"""
+"""Zero-cost tests for the real Claude Desktop 3P config-library switcher."""
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -19,544 +14,466 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROVIDER = ROOT / "Support" / "claude-provider"
+PROVIDER = ROOT / "Support/claude-provider"
 MODULE = SourceFileLoader("claude_provider_test", str(PROVIDER)).load_module()
-
-FAKE_HELPER = "/fake/claude-gateway-cred-helper"
+CONFIG_ID = "00000000-0000-4000-8000-000000000001"
 
 
 class ClaudeProviderTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = Path(tempfile.mkdtemp(prefix="claude-provider-tests-"))
-        self.claude_home = self.temp / "home"
-        self.app_support = self.temp / "app-support"
+        self.claude_home = self.temp / "home/.claude"
+        self.support = self.temp / "home/Library/Application Support/Claude-3p"
+        self.helper = self.claude_home / "deepseek-keychain-helper"
         self.claude_home.mkdir(parents=True)
-        self.app_support.mkdir(parents=True)
-        # Deterministic stubs.
-        self._orig_keychain_ready = MODULE.keychain_ready
-        self._orig_desktop = MODULE.detect_claude_desktop
-        self._orig_engine = MODULE.detect_bundled_claude_code
-        self._orig_cli = MODULE.detect_claude_cli
+        self.support.mkdir(parents=True)
+        self.helper.write_text("#!/bin/zsh\nexit 0\n", encoding="utf-8")
+        self.helper.chmod(0o700)
+
+        self._original_keychain = MODULE.keychain_ready
+        self._original_desktop = MODULE.detect_claude_desktop
+        self._original_engine = MODULE.detect_bundled_claude_code
+        self._original_cli = MODULE.detect_claude_cli
         MODULE.keychain_ready = lambda *a, **k: True
-        MODULE.detect_claude_desktop = lambda: (True, "1.34493.1", "/Applications/Claude.app")
-        MODULE.detect_bundled_claude_code = lambda: (True, "2.1.237", "/fake/engine/claude")
+        MODULE.detect_claude_desktop = lambda: (
+            True,
+            "1.37937.1",
+            "/Applications/Claude.app",
+        )
+        MODULE.detect_bundled_claude_code = lambda: (
+            True,
+            "2.1.246",
+            "/fake/Claude-3p/claude",
+        )
         MODULE.detect_claude_cli = lambda *a, **k: (False, "", "")
 
     def tearDown(self) -> None:
-        MODULE.keychain_ready = self._orig_keychain_ready
-        MODULE.detect_claude_desktop = self._orig_desktop
-        MODULE.detect_bundled_claude_code = self._orig_engine
-        MODULE.detect_claude_cli = self._orig_cli
+        MODULE.keychain_ready = self._original_keychain
+        MODULE.detect_claude_desktop = self._original_desktop
+        MODULE.detect_bundled_claude_code = self._original_engine
+        MODULE.detect_claude_cli = self._original_cli
         shutil.rmtree(self.temp, ignore_errors=True)
 
-    def settings(self) -> Path:
-        return self.claude_home / "settings.json"
+    @property
+    def settings_path(self) -> Path:
+        return MODULE.settings_path(self.claude_home)
 
-    def dev_settings(self) -> Path:
-        return MODULE.developer_settings_path(self.app_support)
+    @property
+    def desktop_path(self) -> Path:
+        return MODULE.desktop_config_path(self.support)
 
-    def write_settings(self, data: dict[str, Any]) -> None:
-        self.settings().parent.mkdir(parents=True, exist_ok=True)
-        self.settings().write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    @property
+    def meta_path(self) -> Path:
+        return MODULE.config_library_meta_path(self.support)
 
-    def write_dev_settings(self, data: dict[str, Any]) -> None:
-        self.dev_settings().parent.mkdir(parents=True, exist_ok=True)
-        self.dev_settings().write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    def active_path(self, config_id: str = CONFIG_ID) -> Path:
+        return MODULE.config_library_entry_path(self.support, config_id)
 
-    def read_settings(self) -> dict[str, Any]:
-        return json.loads(self.settings().read_text(encoding="utf-8"))
+    @staticmethod
+    def write_json(path: Path, data: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
-    def read_dev_settings(self) -> dict[str, Any]:
-        return json.loads(self.dev_settings().read_text(encoding="utf-8"))
+    @staticmethod
+    def read_json(path: Path) -> dict[str, Any]:
+        return json.loads(path.read_text(encoding="utf-8"))
 
-    def switch(self, mode: str) -> dict[str, str]:
-        # Deterministic default: no system proxy for the generic tests.
-        return self.switch_with_proxy(mode, {})
+    def write_official_fixture(self) -> dict[str, dict[str, Any]]:
+        settings = {
+            "permissions": {"allow": ["Read", "Bash(ls:*)"]},
+            "hooks": {"PostToolUse": [{"matcher": "Edit", "hooks": []}]},
+            "mcpServers": {"demo": {"command": "demo"}},
+            "plugins": {"keep": True},
+            "projects": {"/tmp/example": {"allowedTools": ["Read"]}},
+            "env": {
+                "CUSTOM_VAR": "keep-me",
+                "ANTHROPIC_MODEL": "claude-official-choice",
+                "HTTP_PROXY": "http://official.proxy:8080",
+            },
+            "apiKeyHelper": "/usr/local/bin/official-helper",
+        }
+        desktop = {"deploymentMode": "1p", "preferences": {"keep": True}}
+        meta = {
+            "appliedId": CONFIG_ID,
+            "entries": [{"id": CONFIG_ID, "name": "Existing config"}],
+            "metaUnrelated": "keep",
+        }
+        active = {
+            "inferenceProvider": "anthropic",
+            "existingConfigField": {"keep": True},
+        }
+        self.write_json(self.settings_path, settings)
+        self.write_json(self.desktop_path, desktop)
+        self.write_json(self.meta_path, meta)
+        self.write_json(self.active_path(), active)
+        return {
+            "settings": settings,
+            "desktop": desktop,
+            "meta": meta,
+            "active": active,
+        }
 
-    def switch_with_proxy(
-        self, mode: str, proxy_env: dict[str, str] | None
+    def write_deepseek_fixture(self, mode: str) -> None:
+        model = MODULE.model_for_mode(mode)
+        assert model
+        self.write_json(
+            self.settings_path,
+            {
+                "env": MODULE.deepseek_env(model),
+                "apiKeyHelper": str(self.helper),
+            },
+        )
+        self.write_json(self.desktop_path, {"deploymentMode": "3p"})
+        self.write_json(
+            self.meta_path,
+            {
+                "appliedId": CONFIG_ID,
+                "entries": [{"id": CONFIG_ID, "name": "Default"}],
+            },
+        )
+        self.write_json(
+            self.active_path(),
+            MODULE.deepseek_desktop_config({}, mode, str(self.helper)),
+        )
+
+    def switch(
+        self, mode: str, proxy: dict[str, str] | None = None
     ) -> dict[str, str]:
         return MODULE.switch_mode(
             mode,
             self.claude_home,
-            claude_app_support=self.app_support,
-            helper_command=FAKE_HELPER,
-            proxy_env=proxy_env,
+            claude_3p_support=self.support,
+            helper_command=str(self.helper),
+            proxy_env={} if proxy is None else proxy,
         )
 
     def status_values(self) -> dict[str, str]:
-        text = MODULE.status(self.claude_home, claude_app_support=self.app_support)
-        result: dict[str, str] = {}
-        for line in text.splitlines():
-            if "=" in line:
-                key, value = line.split("=", 1)
-                result[key] = value
-        return result
+        text = MODULE.status(
+            self.claude_home,
+            claude_3p_support=self.support,
+            helper_command=str(self.helper),
+        )
+        return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
 
-    # --- detection -----------------------------------------------------
+    # --- real source-of-truth classification --------------------------
 
-    def test_status_default_when_missing(self) -> None:
+    def test_status_default_when_files_are_missing(self) -> None:
         values = self.status_values()
         self.assertEqual(values["current_state"], "default")
         self.assertEqual(values["state_consistent"], "yes")
-        self.assertEqual(values["desktop_installed"], "yes")
-        self.assertEqual(values["desktop_version"], "1.34493.1")
-        self.assertEqual(values["claude_code_installed"], "yes")
-        self.assertEqual(values["claude_code_version"], "2.1.237")
-        self.assertEqual(values["cli_installed"], "no")
-        self.assertEqual(values["desktop_provider"], "anthropic")
+        self.assertEqual(values["claude_3p_support_path"], str(self.support))
 
-    def test_status_cli_installed_is_separate_from_desktop(self) -> None:
-        MODULE.detect_claude_cli = lambda *a, **k: (True, "1.2.3", "/usr/local/bin/claude")
-        values = self.status_values()
-        self.assertEqual(values["cli_installed"], "yes")
-        self.assertEqual(values["desktop_installed"], "yes")
-
-    # --- status classification (settings + developer layers) -----------
-
-    def test_status_deepseek_pro(self) -> None:
-        env = MODULE.deepseek_env("claude-opus-5")
-        self.write_settings({"env": env, "apiKeyHelper": MODULE.API_KEY_HELPER_COMMAND})
-        self.write_dev_settings(
-            MODULE.deepseek_developer_settings("deepseek-pro", FAKE_HELPER)
-        )
+    def test_working_manual_config_shape_is_recognized(self) -> None:
+        self.write_deepseek_fixture("deepseek-pro")
+        active = self.read_json(self.active_path())
+        # The verified manual file omitted these because Desktop defaults to
+        # bearer and skips discovery when a sufficient model list exists.
+        active.pop("inferenceGatewayAuthScheme")
+        active.pop("modelDiscoveryEnabled")
+        self.write_json(self.active_path(), active)
         values = self.status_values()
         self.assertEqual(values["current_state"], "deepseek-pro")
-        self.assertEqual(values["state_label"], "DeepSeek V4 Pro")
-        self.assertEqual(values["state_consistent"], "yes")
-        self.assertEqual(values["auth"], "keychain-helper")
-        self.assertEqual(values["api_key_helper"], "present")
+        self.assertEqual(values["deployment_mode"], "3p")
         self.assertEqual(values["desktop_provider"], "gateway")
-        self.assertEqual(values["desktop_default_model"], "claude-opus-5")
+        self.assertEqual(values["desktop_auth_scheme"], "bearer")
 
-    def test_status_deepseek_flash(self) -> None:
-        env = MODULE.deepseek_env("claude-sonnet-5")
-        self.write_settings({"env": env, "apiKeyHelper": MODULE.API_KEY_HELPER_COMMAND})
-        self.write_dev_settings(
-            MODULE.deepseek_developer_settings("deepseek-flash", FAKE_HELPER)
-        )
-        values = self.status_values()
-        self.assertEqual(values["current_state"], "deepseek-flash")
-        self.assertEqual(values["state_consistent"], "yes")
-        self.assertEqual(values["desktop_default_model"], "claude-sonnet-5")
-
-    def test_status_haiku_default_counts_as_flash(self) -> None:
-        env = MODULE.deepseek_env("claude-haiku-4-5-20251001")
-        self.write_settings({"env": env, "apiKeyHelper": MODULE.API_KEY_HELPER_COMMAND})
-        dev = MODULE.deepseek_developer_settings("deepseek-flash", FAKE_HELPER)
-        dev["models"]["list"] = [dev["models"]["list"][2]] + dev["models"]["list"][:2]
-        self.write_dev_settings(dev)
-        values = self.status_values()
-        self.assertEqual(values["current_state"], "deepseek-flash")
-        self.assertEqual(values["desktop_default_model"], MODULE.HAIKU_MODEL)
-
-    def test_status_inconsistent_unknown_model(self) -> None:
-        self.write_settings(
+    def test_settings_json_alone_never_claims_desktop_success(self) -> None:
+        self.write_json(
+            self.settings_path,
             {
-                "env": {
-                    "ANTHROPIC_BASE_URL": MODULE.DEEPSEEK_ANTHROPIC_BASE_URL,
-                    "ANTHROPIC_MODEL": "deepseek-v4-pro",
-                }
-            }
-        )
-        self.write_dev_settings(
-            MODULE.deepseek_developer_settings("deepseek-pro", FAKE_HELPER)
+                "env": MODULE.deepseek_env(MODULE.PRO_MODEL),
+                "apiKeyHelper": str(self.helper),
+            },
         )
         values = self.status_values()
         self.assertEqual(values["current_state"], "inconsistent")
-        self.assertEqual(values["state_consistent"], "no")
-        self.assertTrue(values["inconsistency_reason"])
+        self.assertIn("Desktop=default", values["inconsistency_reason"])
 
-    def test_status_works_without_deepseek_developer_config(self) -> None:
-        # settings.json is the single source of truth for Claude Code: a
-        # DeepSeek engine config must not be judged inconsistent merely
-        # because the optional developer_settings.json lacks DeepSeek
-        # inference/models blocks.
-        env = MODULE.deepseek_env("claude-opus-5")
-        self.write_settings({"env": env, "apiKeyHelper": MODULE.API_KEY_HELPER_COMMAND})
-        values = self.status_values()
-        self.assertEqual(values["current_state"], "deepseek-pro")
-        self.assertEqual(values["state_consistent"], "yes")
-
-    def test_status_developer_leftover_does_not_override_official(self) -> None:
-        # A leftover DeepSeek developer config is optional Desktop-layer
-        # information; it must not flip an official settings.json state.
-        self.write_dev_settings(
-            MODULE.deepseek_developer_settings("deepseek-pro", FAKE_HELPER)
-        )
-        values = self.status_values()
-        self.assertEqual(values["current_state"], "default")
-        self.assertEqual(values["state_consistent"], "yes")
-
-    def test_status_dev_allow_devtools_only(self) -> None:
-        # Real-world A/B result: developer_settings.json containing only
-        # {"allowDevTools": true} still works via settings.json.
-        env = MODULE.deepseek_env("claude-opus-5")
-        self.write_settings({"env": env, "apiKeyHelper": MODULE.API_KEY_HELPER_COMMAND})
-        self.write_dev_settings({"allowDevTools": True})
-        values = self.status_values()
-        self.assertEqual(values["current_state"], "deepseek-pro")
-        self.assertEqual(values["state_consistent"], "yes")
-        self.assertEqual(values["desktop_provider"], "anthropic")
-
-    def test_status_official_with_user_model_preference(self) -> None:
-        # A user's own model preference without a DeepSeek base URL is still
-        # the official Claude configuration.
-        self.write_settings({"env": {"ANTHROPIC_MODEL": "claude-opus-5"}})
-        values = self.status_values()
-        self.assertEqual(values["current_state"], "default")
-        self.assertEqual(values["state_consistent"], "yes")
-
-    def test_status_invalid_json(self) -> None:
-        self.settings().write_text("{ not valid json", encoding="utf-8")
+    def test_desktop_alone_never_claims_direct_cli_success(self) -> None:
+        self.write_deepseek_fixture("deepseek-pro")
+        self.write_json(self.settings_path, {"permissions": {"allow": ["Read"]}})
         values = self.status_values()
         self.assertEqual(values["current_state"], "inconsistent")
-        self.assertIn("JSON", values["inconsistency_reason"])
+        self.assertIn("直接 CLI=default", values["inconsistency_reason"])
 
-    # --- switching ------------------------------------------------------
+    def test_wrong_auth_or_discovery_is_inconsistent(self) -> None:
+        self.write_deepseek_fixture("deepseek-pro")
+        active = self.read_json(self.active_path())
+        active["inferenceGatewayAuthScheme"] = "x-api-key"
+        active["modelDiscoveryEnabled"] = True
+        self.write_json(self.active_path(), active)
+        values = self.status_values()
+        self.assertEqual(values["current_state"], "inconsistent")
+        self.assertIn("bearer", values["inconsistency_reason"])
 
-    def test_switch_pro_then_default_restores_original(self) -> None:
-        original = {
-            "permissions": {"allow": ["Bash(ls:*)"]},
-            "hooks": {"PostToolUse": [{"matcher": "Edit", "hooks": []}]},
-            "mcpServers": {"demo": {"command": "npx", "args": ["-y", "demo"]}},
-            "env": {"CUSTOM_VAR": "keep-me", "ANTHROPIC_MODEL": "claude-opus-4-1"},
-            "apiKeyHelper": "/usr/bin/custom-helper",
-        }
-        original_dev = {
-            "extensions": {"custom": {"enabled": True}},
-            "plugins": {"my-plugin": True},
-        }
-        self.write_settings(original)
-        self.write_dev_settings(original_dev)
+    def test_first_model_is_the_real_default_tier(self) -> None:
+        pro = MODULE.deepseek_desktop_config({}, "deepseek-pro", str(self.helper))
+        flash = MODULE.deepseek_desktop_config({}, "deepseek-flash", str(self.helper))
+        self.assertEqual(pro["inferenceModels"][0]["anthropicFamilyTier"], "opus")
+        self.assertEqual(pro["inferenceModels"][0]["name"], MODULE.PRO_MODEL)
+        self.assertEqual(flash["inferenceModels"][0]["anthropicFamilyTier"], "sonnet")
+        self.assertEqual(flash["inferenceModels"][0]["name"], MODULE.FLASH_MODEL)
 
-        self.switch("deepseek-pro")
-        after_pro = self.read_settings()
-        self.assertEqual(
-            after_pro["env"]["ANTHROPIC_BASE_URL"],
-            MODULE.DEEPSEEK_ANTHROPIC_BASE_URL,
-        )
-        self.assertEqual(after_pro["env"]["ANTHROPIC_MODEL"], "claude-opus-5")
-        self.assertEqual(after_pro["env"]["CUSTOM_VAR"], "keep-me")
-        self.assertEqual(after_pro["permissions"], original["permissions"])
-        self.assertEqual(after_pro["hooks"], original["hooks"])
-        self.assertEqual(after_pro["mcpServers"], original["mcpServers"])
-        self.assertNotIn("sk-", after_pro["apiKeyHelper"])
+    # --- acceptance sequence and restoration --------------------------
 
-        after_pro_dev = self.read_dev_settings()
-        self.assertEqual(after_pro_dev["inference"]["provider"], "gateway")
-        self.assertEqual(
-            after_pro_dev["inference"]["baseUrl"],
-            MODULE.DEEPSEEK_ANTHROPIC_BASE_URL,
-        )
-        self.assertEqual(
-            after_pro_dev["inference"]["credential"]["kind"], "helper-script"
-        )
-        self.assertEqual(
-            after_pro_dev["inference"]["credential"]["command"], FAKE_HELPER
-        )
-        # Original developer keys are preserved.
-        self.assertEqual(after_pro_dev["extensions"], original_dev["extensions"])
-        self.assertEqual(after_pro_dev["plugins"], original_dev["plugins"])
-        # First model entry is the Pro default.
-        self.assertEqual(
-            after_pro_dev["models"]["list"][0]["name"], "claude-opus-5"
-        )
-        self.assertEqual(
-            after_pro_dev["models"]["list"][0]["anthropicFamilyTier"], "opus"
-        )
+    def test_official_to_pro_to_flash_to_official(self) -> None:
+        original = self.write_official_fixture()
+        original_settings_bytes = self.settings_path.read_bytes()
+        original_desktop_bytes = self.desktop_path.read_bytes()
 
-        self.switch("default")
-        after_default = self.read_settings()
-        self.assertEqual(after_default["permissions"], original["permissions"])
-        self.assertEqual(after_default["hooks"], original["hooks"])
-        self.assertEqual(after_default["mcpServers"], original["mcpServers"])
-        self.assertEqual(after_default["env"]["CUSTOM_VAR"], "keep-me")
-        self.assertEqual(after_default["env"]["ANTHROPIC_MODEL"], "claude-opus-4-1")
-        self.assertNotIn("ANTHROPIC_BASE_URL", after_default["env"])
-        self.assertEqual(after_default["apiKeyHelper"], "/usr/bin/custom-helper")
-        # Developer settings restore to the exact original object.
-        self.assertEqual(self.read_dev_settings(), original_dev)
-
-    def test_switch_creates_developer_settings_when_absent(self) -> None:
-        self.write_settings({"env": {}})
-        self.switch("deepseek-pro")
-        self.assertTrue(self.dev_settings().exists())
-        self.switch("default")
-        self.assertFalse(self.dev_settings().exists())
-
-    def test_switch_flash(self) -> None:
-        self.write_settings({"env": {}})
-        self.switch("deepseek-flash")
-        env = self.read_settings()["env"]
-        self.assertEqual(env["ANTHROPIC_MODEL"], "claude-sonnet-5")
-        self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-5")
-        self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-5")
-        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], MODULE.HAIKU_MODEL)
-        self.assertEqual(self.read_settings()["apiKeyHelper"], MODULE.API_KEY_HELPER_COMMAND)
-        dev = self.read_dev_settings()
-        self.assertEqual(dev["models"]["list"][0]["name"], "claude-sonnet-5")
-        self.assertEqual(dev["models"]["list"][0]["anthropicFamilyTier"], "sonnet")
-
-    def test_switch_without_key_fails_and_preserves_config(self) -> None:
-        MODULE.keychain_ready = lambda *a, **k: False
-        original = {"permissions": {"deny": ["WebFetch"]}}
-        self.write_settings(original)
-        with self.assertRaises(MODULE.ClaudeProviderError):
-            self.switch("deepseek-pro")
-        self.assertEqual(self.read_settings(), original)
-        self.assertFalse(self.dev_settings().exists())
-
-    def test_idempotent_repeated_switch(self) -> None:
-        self.write_settings({"env": {}})
-        self.switch("deepseek-pro")
-        first = self.read_settings()
-        first_dev = self.read_dev_settings()
-        backups_before = len(list(MODULE.backup_dir(self.claude_home).glob("*.bak")))
-        self.switch("deepseek-pro")
-        self.assertEqual(self.read_settings(), first)
-        self.assertEqual(self.read_dev_settings(), first_dev)
-        # The no-op switch must not create new backups.
-        backups_after = len(list(MODULE.backup_dir(self.claude_home).glob("*.bak")))
-        self.assertEqual(backups_after, backups_before)
-        self.switch("default")
-        second = self.read_settings()
-        self.switch("default")
-        self.assertEqual(self.read_settings(), second)
-
-    def test_mid_failure_rollback(self) -> None:
-        original = {"permissions": {"allow": ["Read"]}, "env": {"CUSTOM": "x"}}
-        self.write_settings(original)
-        original_write = MODULE.atomic_write_json
-
-        def corrupting_write(path: Path, data: Any) -> None:
-            MODULE.atomic_write_json(path, {"env": {"ANTHROPIC_MODEL": "WRONG"}})
-
-        MODULE.atomic_write_json = corrupting_write
-        try:
-            with self.assertRaises(Exception):
-                self.switch("deepseek-pro")
-        finally:
-            MODULE.atomic_write_json = original_write
-
-        self.assertEqual(self.read_settings(), original)
-        self.assertFalse(self.dev_settings().exists())
-
-    def test_cross_tool_isolation(self) -> None:
-        codex_home = self.temp / "codex-home"
-        codex_home.mkdir()
-        codex_config = codex_home / "config.toml"
-        codex_config.write_text(
-            'model = "deepseek-v4-pro"\nmodel_provider = "deepseek"\n', encoding="utf-8"
-        )
-        self.write_settings({"env": {}})
-        self.switch("deepseek-flash")
-        self.assertEqual(
-            codex_config.read_text(encoding="utf-8"),
-            'model = "deepseek-v4-pro"\nmodel_provider = "deepseek"\n',
-        )
-        self.assertEqual(MODULE.KEYCHAIN_SERVICE, "claude-code-deepseek-api-key")
-        self.assertNotEqual(MODULE.KEYCHAIN_SERVICE, "codex-deepseek-api-key")
-
-    def test_secret_never_written_to_settings(self) -> None:
-        self.write_settings({"env": {}})
-        self.switch("deepseek-pro")
-        text = self.settings().read_text(encoding="utf-8")
-        self.assertNotIn("sk-", text)
-        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", text)
-        self.assertIn("security find-generic-password", text)
-        dev_text = self.dev_settings().read_text(encoding="utf-8")
-        self.assertNotIn("sk-", dev_text)
-        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", dev_text)
-        self.assertIn(FAKE_HELPER, dev_text)
-
-    def test_default_without_prior_state_keeps_settings(self) -> None:
-        original = {"env": {"CUSTOM_VAR": "x"}, "permissions": {"allow": ["Read"]}}
-        self.write_settings(original)
-        self.switch("default")
-        self.assertEqual(self.read_settings(), original)
-        self.assertFalse(self.dev_settings().exists())
-
-    def test_classify_model_mapping(self) -> None:
-        self.assertEqual(MODULE.classify_env({})[0], "default")
-        pro = MODULE.deepseek_env("claude-opus-5")
-        self.assertEqual(MODULE.classify_env(pro)[0], "deepseek-pro")
-        flash = MODULE.deepseek_env("claude-sonnet-5")
-        self.assertEqual(MODULE.classify_env(flash)[0], "deepseek-flash")
-        haiku = MODULE.deepseek_env("claude-haiku-4-5-20251001")
-        self.assertEqual(MODULE.classify_env(haiku)[0], "deepseek-flash")
-
-    def test_developer_settings_classification(self) -> None:
-        dev = MODULE.deepseek_developer_settings("deepseek-pro", FAKE_HELPER)
-        state, tier, default_model, reason = MODULE.classify_developer_settings(dev)
-        self.assertEqual(state, "deepseek")
-        self.assertEqual(tier, "opus")
-        self.assertEqual(default_model, "claude-opus-5")
-        self.assertEqual(reason, "")
-        flash_dev = MODULE.deepseek_developer_settings("deepseek-flash", FAKE_HELPER)
-        self.assertEqual(
-            MODULE.classify_developer_settings(flash_dev)[1], "flash"
-        )
-        self.assertEqual(MODULE.classify_developer_settings({})[0], "official")
-        self.assertEqual(
-            MODULE.classify_developer_settings(
-                {"inference": {"provider": "anthropic"}}
-            )[0],
-            "official",
-        )
-
-    def test_switch_pro_and_flash_reorder_default_model(self) -> None:
-        self.write_settings({"env": {}})
-        self.switch("deepseek-pro")
-        self.assertEqual(
-            self.read_dev_settings()["models"]["list"][0]["name"], "claude-opus-5"
-        )
-        self.switch("deepseek-flash")
-        self.assertEqual(
-            self.read_dev_settings()["models"]["list"][0]["name"], "claude-sonnet-5"
-        )
-
-    # --- system proxy handling ------------------------------------------
-
-    def test_parse_scutil_proxy_output_present(self) -> None:
-        output = """<dictionary> {
-  HTTPEnable : 1
-  HTTPPort : 7897
-  HTTPProxy : 127.0.0.1
-  HTTPSEnable : 1
-  HTTPSPort : 7897
-  HTTPSProxy : 127.0.0.1
-}
-"""
-        env = MODULE.parse_scutil_proxy_output(output)
-        self.assertEqual(env["HTTP_PROXY"], "http://127.0.0.1:7897")
-        self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:7897")
-
-    def test_parse_scutil_proxy_output_absent(self) -> None:
-        self.assertEqual(MODULE.parse_scutil_proxy_output(""), {})
-        self.assertEqual(
-            MODULE.parse_scutil_proxy_output("<dictionary> {\n}\n"), {}
-        )
-
-    def test_parse_scutil_proxy_output_http_disabled_falls_back(self) -> None:
-        output = """<dictionary> {
-  HTTPEnable : 0
-  HTTPPort : 7897
-  HTTPProxy : 127.0.0.1
-  HTTPSEnable : 1
-  HTTPSPort : 7897
-  HTTPSProxy : 127.0.0.1
-}
-"""
-        env = MODULE.parse_scutil_proxy_output(output)
-        # Same cross-fallback as the Codex bridge: http reuses the https
-        # endpoint when the http proxy is disabled.
-        self.assertEqual(env["HTTP_PROXY"], "http://127.0.0.1:7897")
-        self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:7897")
-
-    def test_parse_scutil_proxy_output_https_falls_back_to_http(self) -> None:
-        output = """<dictionary> {
-  HTTPEnable : 1
-  HTTPPort : 7897
-  HTTPProxy : 127.0.0.1
-  HTTPSEnable : 0
-}
-"""
-        env = MODULE.parse_scutil_proxy_output(output)
-        self.assertEqual(env["HTTP_PROXY"], "http://127.0.0.1:7897")
-        # Same fallback as the Codex bridge: https reuses the http endpoint.
-        self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:7897")
-
-    def test_parse_scutil_proxy_output_invalid_port_and_ipv6(self) -> None:
-        invalid = """<dictionary> {
-  HTTPEnable : 1
-  HTTPPort : 0
-  HTTPProxy : 127.0.0.1
-  HTTPSEnable : 1
-  HTTPSPort : 7897
-  HTTPSProxy : fe80::1%en0
-}
-        """
-        env = MODULE.parse_scutil_proxy_output(invalid)
-        # The invalid http endpoint (port 0) falls back to the https one.
-        self.assertEqual(env["HTTP_PROXY"], "http://[fe80::1%en0]:7897")
-        self.assertEqual(env["HTTPS_PROXY"], "http://[fe80::1%en0]:7897")
-
-    def test_switch_writes_system_proxy(self) -> None:
-        self.write_settings({"env": {}})
-        self.switch_with_proxy(
+        self.switch(
             "deepseek-pro",
             {
                 "HTTP_PROXY": "http://127.0.0.1:7897",
                 "HTTPS_PROXY": "http://127.0.0.1:7897",
             },
         )
-        env = self.read_settings()["env"]
+        self.assertEqual(self.status_values()["current_state"], "deepseek-pro")
+        after_pro = self.read_json(self.settings_path)
+        active_pro = self.read_json(self.active_path())
+        self.assertEqual(after_pro["env"]["ANTHROPIC_MODEL"], MODULE.PRO_MODEL)
+        self.assertEqual(after_pro["apiKeyHelper"], str(self.helper))
+        self.assertEqual(after_pro["permissions"], original["settings"]["permissions"])
+        self.assertEqual(active_pro["inferenceGatewayAuthScheme"], "bearer")
+        self.assertFalse(active_pro["modelDiscoveryEnabled"])
+        self.assertEqual(active_pro["inferenceModels"][0]["name"], MODULE.PRO_MODEL)
+        snapshots = list(MODULE.snapshot_root(self.claude_home).glob("*/manifest.json"))
+        self.assertEqual(len(snapshots), 1)
+        snapshot = MODULE.load_official_snapshot(self.claude_home)
+        assert snapshot
+        self.assertEqual(snapshot["files"]["settings"], original_settings_bytes)
+        self.assertEqual(snapshot["files"]["desktop"], original_desktop_bytes)
+
+        # Simulate unrelated edits while DeepSeek is active.  The restore must
+        # not erase them.
+        after_pro["hooks"]["newWhileDeepSeek"] = True
+        self.write_json(self.settings_path, after_pro)
+        active_pro["existingConfigField"]["addedWhileDeepSeek"] = True
+        self.write_json(self.active_path(), active_pro)
+
+        self.switch("deepseek-flash")
+        self.assertEqual(self.status_values()["current_state"], "deepseek-flash")
+        self.assertEqual(
+            self.read_json(self.active_path())["inferenceModels"][0]["name"],
+            MODULE.FLASH_MODEL,
+        )
+        self.assertEqual(
+            len(list(MODULE.snapshot_root(self.claude_home).glob("*/manifest.json"))),
+            1,
+        )
+
+        self.switch("default")
+        values = self.status_values()
+        self.assertEqual(values["current_state"], "default")
+        restored = self.read_json(self.settings_path)
+        self.assertEqual(restored["env"], original["settings"]["env"])
+        self.assertEqual(restored["apiKeyHelper"], original["settings"]["apiKeyHelper"])
+        self.assertTrue(restored["hooks"]["newWhileDeepSeek"])
+        self.assertEqual(self.read_json(self.desktop_path)["deploymentMode"], "1p")
+        restored_active = self.read_json(self.active_path())
+        self.assertEqual(restored_active["inferenceProvider"], "anthropic")
+        self.assertTrue(restored_active["existingConfigField"]["addedWhileDeepSeek"])
+        self.assertNotIn("inferenceGatewayBaseUrl", restored_active)
+        self.assertEqual(self.read_json(self.meta_path)["metaUnrelated"], "keep")
+
+    def test_missing_official_files_are_recreated_then_removed(self) -> None:
+        self.switch("deepseek-pro")
+        self.assertTrue(self.settings_path.exists())
+        self.assertTrue(self.desktop_path.exists())
+        meta = self.read_json(self.meta_path)
+        created_id = meta["appliedId"]
+        created_active = self.active_path(created_id)
+        self.assertTrue(created_active.exists())
+        self.switch("default")
+        self.assertFalse(self.settings_path.exists())
+        self.assertFalse(self.desktop_path.exists())
+        self.assertFalse(self.meta_path.exists())
+        self.assertFalse(created_active.exists())
+        self.assertEqual(self.status_values()["current_state"], "default")
+
+    def test_fallback_official_preserves_manual_3p_library(self) -> None:
+        self.write_deepseek_fixture("deepseek-flash")
+        settings = self.read_json(self.settings_path)
+        settings["permissions"] = {"allow": ["Read"]}
+        self.write_json(self.settings_path, settings)
+        active_before = self.active_path().read_bytes()
+        self.switch("default")
+        restored = self.read_json(self.settings_path)
+        self.assertEqual(restored["permissions"], {"allow": ["Read"]})
+        self.assertNotIn("ANTHROPIC_BASE_URL", restored.get("env", {}))
+        self.assertNotIn("apiKeyHelper", restored)
+        self.assertEqual(self.desktop_path and self.read_json(self.desktop_path)["deploymentMode"], "1p")
+        self.assertEqual(self.active_path().read_bytes(), active_before)
+
+    def test_restore_preserves_original_custom_proxy(self) -> None:
+        original = self.write_official_fixture()
+        self.switch(
+            "deepseek-pro",
+            {
+                "HTTP_PROXY": "http://127.0.0.1:7897",
+                "HTTPS_PROXY": "http://127.0.0.1:7897",
+            },
+        )
+        env = self.read_json(self.settings_path)["env"]
         self.assertEqual(env["HTTP_PROXY"], "http://127.0.0.1:7897")
         self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:7897")
-
-    def test_switch_flash_writes_system_proxy(self) -> None:
-        self.write_settings({"env": {}})
-        self.switch_with_proxy(
-            "deepseek-flash",
-            {"HTTP_PROXY": "http://10.0.0.1:3128", "HTTPS_PROXY": "http://10.0.0.1:3128"},
-        )
-        env = self.read_settings()["env"]
-        self.assertEqual(env["ANTHROPIC_MODEL"], "claude-sonnet-5")
-        self.assertEqual(env["HTTP_PROXY"], "http://10.0.0.1:3128")
-
-    def test_switch_no_system_proxy_writes_nothing(self) -> None:
-        self.write_settings({"env": {}})
-        self.switch_with_proxy("deepseek-pro", {})
-        env = self.read_settings()["env"]
-        self.assertNotIn("HTTP_PROXY", env)
-        self.assertNotIn("HTTPS_PROXY", env)
-
-    def test_switch_no_system_proxy_keeps_existing_custom_proxy(self) -> None:
-        self.write_settings(
-            {"env": {"HTTP_PROXY": "http://10.0.0.1:3128", "CUSTOM": "x"}}
-        )
-        self.switch_with_proxy("deepseek-pro", {})
-        env = self.read_settings()["env"]
-        self.assertEqual(env["HTTP_PROXY"], "http://10.0.0.1:3128")
-        self.assertEqual(env["CUSTOM"], "x")
-
-    def test_switch_overrides_custom_proxy_with_system_proxy(self) -> None:
-        self.write_settings(
-            {"env": {"HTTP_PROXY": "http://10.0.0.1:3128", "HTTPS_PROXY": "http://10.0.0.1:3128"}}
-        )
-        self.switch_with_proxy(
-            "deepseek-pro",
-            {"HTTP_PROXY": "http://127.0.0.1:7897", "HTTPS_PROXY": "http://127.0.0.1:7897"},
-        )
-        env = self.read_settings()["env"]
-        self.assertEqual(env["HTTP_PROXY"], "http://127.0.0.1:7897")
-        self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:7897")
-
-    def test_restore_original_custom_proxy_on_default(self) -> None:
-        original = {"env": {"HTTP_PROXY": "http://10.0.0.1:3128", "CUSTOM": "y"}}
-        self.write_settings(original)
-        self.switch_with_proxy(
-            "deepseek-pro",
-            {"HTTP_PROXY": "http://127.0.0.1:7897", "HTTPS_PROXY": "http://127.0.0.1:7897"},
-        )
         self.switch("default")
-        env = self.read_settings()["env"]
-        self.assertEqual(env["HTTP_PROXY"], "http://10.0.0.1:3128")
-        self.assertNotIn("HTTPS_PROXY", env)
-        self.assertEqual(env["CUSTOM"], "y")
-
-    def test_restore_removes_proxy_when_original_had_none(self) -> None:
-        self.write_settings({"env": {"CUSTOM": "z"}})
-        self.switch_with_proxy(
-            "deepseek-pro",
-            {"HTTP_PROXY": "http://127.0.0.1:7897", "HTTPS_PROXY": "http://127.0.0.1:7897"},
+        self.assertEqual(
+            self.read_json(self.settings_path)["env"], original["settings"]["env"]
         )
-        self.switch("default")
-        env = self.read_settings()["env"]
-        self.assertNotIn("HTTP_PROXY", env)
-        self.assertNotIn("HTTPS_PROXY", env)
-        self.assertEqual(env["CUSTOM"], "z")
+
+    def test_repeated_switch_is_idempotent(self) -> None:
+        self.write_official_fixture()
+        self.switch("deepseek-pro")
+        files_before = {
+            path: path.read_bytes()
+            for path in (self.settings_path, self.desktop_path, self.meta_path, self.active_path())
+        }
+        backups_before = len(list(MODULE.backup_dir(self.claude_home).glob("*.bak")))
+        self.switch("deepseek-pro")
+        self.assertEqual(
+            files_before,
+            {path: path.read_bytes() for path in files_before},
+        )
+        self.assertEqual(
+            len(list(MODULE.backup_dir(self.claude_home).glob("*.bak"))),
+            backups_before,
+        )
+
+    # --- safety / rollback --------------------------------------------
+
+    def test_missing_keychain_fails_without_mutation(self) -> None:
+        self.write_official_fixture()
+        before = self.settings_path.read_bytes()
+        MODULE.keychain_ready = lambda *a, **k: False
+        with self.assertRaises(MODULE.ClaudeProviderError):
+            self.switch("deepseek-pro")
+        self.assertEqual(self.settings_path.read_bytes(), before)
+
+    def test_missing_helper_fails_without_mutation(self) -> None:
+        self.write_official_fixture()
+        before = self.settings_path.read_bytes()
+        self.helper.unlink()
+        with self.assertRaises(MODULE.ClaudeProviderError):
+            self.switch("deepseek-pro")
+        self.assertEqual(self.settings_path.read_bytes(), before)
+
+    def test_mid_transaction_failure_rolls_every_file_back(self) -> None:
+        self.write_official_fixture()
+        tracked = (self.settings_path, self.desktop_path, self.meta_path, self.active_path())
+        before = {path: path.read_bytes() for path in tracked}
+        original_atomic = MODULE.atomic_write_bytes
+        failed = False
+
+        def fail_once(path: Path, data: bytes) -> None:
+            nonlocal failed
+            if path == self.meta_path and not failed:
+                failed = True
+                raise OSError("injected write failure")
+            original_atomic(path, data)
+
+        MODULE.atomic_write_bytes = fail_once
+        try:
+            with self.assertRaises(OSError):
+                self.switch("deepseek-pro")
+        finally:
+            MODULE.atomic_write_bytes = original_atomic
+        self.assertEqual(before, {path: path.read_bytes() for path in tracked})
+
+    def test_invalid_json_is_not_overwritten(self) -> None:
+        self.settings_path.write_text("{ invalid", encoding="utf-8")
+        with self.assertRaises(MODULE.ClaudeProviderError):
+            self.switch("deepseek-pro")
+        self.assertEqual(self.settings_path.read_text(encoding="utf-8"), "{ invalid")
+
+    def test_no_secret_is_persisted_or_logged_by_config(self) -> None:
+        self.write_official_fixture()
+        self.switch("deepseek-pro")
+        paths = [
+            self.settings_path,
+            self.desktop_path,
+            self.meta_path,
+            self.active_path(),
+            MODULE.snapshot_pointer_path(self.claude_home),
+        ] + list(MODULE.snapshot_root(self.claude_home).glob("*/*"))
+        combined = b"\n".join(path.read_bytes() for path in paths if path.is_file())
+        self.assertNotIn(b"ANTHROPIC_AUTH_TOKEN", combined)
+        self.assertNotIn(b"ANTHROPIC_API_KEY", combined)
+        self.assertNotIn(b"sk-", combined)
+        self.assertIn(str(self.helper).encode(), combined)
+
+    def test_config_permissions_are_private(self) -> None:
+        self.switch("deepseek-pro")
+        for path in (self.settings_path, self.desktop_path, self.meta_path):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_codex_keychain_service_is_isolated(self) -> None:
+        self.assertEqual(MODULE.KEYCHAIN_SERVICE, "claude-code-deepseek-api-key")
+        self.assertNotEqual(MODULE.KEYCHAIN_SERVICE, "codex-deepseek-api-key")
+
+    # --- proxy and path helpers ---------------------------------------
+
+    def test_parse_scutil_proxy_output(self) -> None:
+        output = """<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 7897
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 7897
+  HTTPSProxy : 127.0.0.1
+}
+"""
+        self.assertEqual(
+            MODULE.parse_scutil_proxy_output(output),
+            {
+                "HTTP_PROXY": "http://127.0.0.1:7897",
+                "HTTPS_PROXY": "http://127.0.0.1:7897",
+            },
+        )
+
+    def test_proxy_fallback_and_ipv6(self) -> None:
+        output = """<dictionary> {
+  HTTPEnable : 0
+  HTTPSEnable : 1
+  HTTPSPort : 3128
+  HTTPSProxy : fe80::1%en0
+}
+"""
+        self.assertEqual(
+            MODULE.parse_scutil_proxy_output(output),
+            {
+                "HTTP_PROXY": "http://[fe80::1%en0]:3128",
+                "HTTPS_PROXY": "http://[fe80::1%en0]:3128",
+            },
+        )
+
+    def test_path_overrides_and_helper_default(self) -> None:
+        home = str(self.temp / "example")
+        self.assertTrue(
+            str(MODULE.resolve_claude_3p_support(home=home)).endswith(
+                "Library/Application Support/Claude-3p"
+            )
+        )
+        self.assertTrue(
+            MODULE.credential_helper_command(home=home).endswith(
+                ".claude/deepseek-keychain-helper"
+            )
+        )
+        override = MODULE.resolve_claude_3p_support(
+            {"CODEX_SWITCHER_CLAUDE_3P_SUPPORT": str(self.support)}
+        )
+        self.assertEqual(override, self.support.resolve())
+
+    def test_status_reports_installation_layers_separately(self) -> None:
+        MODULE.detect_claude_cli = lambda *a, **k: (
+            True,
+            "2.1.246",
+            "/usr/local/bin/claude",
+        )
+        values = self.status_values()
+        self.assertEqual(values["desktop_installed"], "yes")
+        self.assertEqual(values["claude_code_installed"], "yes")
+        self.assertEqual(values["cli_installed"], "yes")
 
 
 if __name__ == "__main__":

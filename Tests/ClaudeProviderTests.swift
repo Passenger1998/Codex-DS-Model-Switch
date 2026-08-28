@@ -41,6 +41,8 @@ enum ClaudeProviderTests {
         claude_code_installed=yes
         desktop_provider=gateway
         desktop_default_model=claude-opus-5
+        deployment_mode=3p
+        helper_ready=yes
         auth=keychain-helper
         """)
         let inconsistent = ClaudeStatus(output: """
@@ -68,6 +70,8 @@ enum ClaudeProviderTests {
         try expect(pro.displayName == "DeepSeek V4 Pro", "DeepSeek Pro 显示名错误")
         try expect(pro.desktopProvider == "gateway", "desktopProvider 解析错误")
         try expect(pro.desktopDefaultModel == "claude-opus-5", "desktopDefaultModel 解析错误")
+        try expect(pro.deploymentMode == "3p", "deploymentMode 解析错误")
+        try expect(pro.helperReady, "helperReady 应为 true")
 
         try expect(inconsistent.currentMode == nil, "不一致状态不应映射为可选模式")
         try expect(!inconsistent.isConsistent, "不一致状态应被识别")

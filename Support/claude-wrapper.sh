@@ -1,21 +1,13 @@
 #!/bin/zsh
 # claude-provider: managed launch wrapper (standalone CLI compatibility only)
-# Injects the DeepSeek API token from macOS Keychain into the environment and
-# then execs the real `claude` CLI.  The token is read at launch time only and
-# is never persisted, logged, or written into settings.json.
+# Locates and execs the real `claude` CLI without injecting credentials into
+# its environment. Current Claude Code reads apiKeyHelper from settings.json;
+# official mode restores the user's original helper exactly.
 #
-# NOTE: the primary target is the Claude Code engine bundled inside the
-# Claude Desktop app, which reads ~/.claude/settings.json (including its
-# apiKeyHelper) directly.  This wrapper exists only as an optional
+# NOTE: Claude Desktop 3P mode is configured independently through its
+# Claude-3p config library. This wrapper exists only as an optional
 # compatibility layer for a standalone `claude` CLI.
 set -euo pipefail
-
-service="claude-code-deepseek-api-key"
-account="deepseek"
-
-if token="$(/usr/bin/security find-generic-password -s "$service" -a "$account" -w 2>/dev/null)"; then
-  export ANTHROPIC_AUTH_TOKEN="$token"
-fi
 
 self="$0"
 

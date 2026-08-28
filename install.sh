@@ -9,6 +9,7 @@ launch_agent="$launch_agents_dir/local.codex-deepseek-proxy.plist"
 proxy_dir="$codex_home/deepseek-proxy"
 bin_dir="$codex_home/bin"
 claude_bin_dir="$claude_home/bin"
+claude_helper="$claude_home/deepseek-keychain-helper"
 log_dir="$codex_home/log"
 label="local.codex-deepseek-proxy"
 domain="gui/$(id -u)"
@@ -27,7 +28,9 @@ install -d -m 700 "$claude_home" "$claude_bin_dir"
 install -m 700 "$root_dir/Support/deepseek_responses_proxy.py" "$proxy_dir/proxy.py"
 install -m 700 "$root_dir/Support/codex-provider" "$bin_dir/codex-provider"
 install -m 700 "$root_dir/Support/claude-provider" "$bin_dir/claude-provider"
-install -m 700 "$root_dir/Support/claude-gateway-cred-helper.sh" "$bin_dir/claude-gateway-cred-helper"
+if [[ ! -e "$claude_helper" ]]; then
+  install -m 700 "$root_dir/Support/claude-gateway-cred-helper.sh" "$claude_helper"
+fi
 install -m 600 "$root_dir/Support/deepseek.models.json" "$codex_home/deepseek.models.json"
 
 # Install the optional standalone-CLI launch wrapper only when it does not

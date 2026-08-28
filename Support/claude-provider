@@ -1,86 +1,35 @@
 #!/usr/bin/env python3
-"""Claude Desktop / Claude Code provider manager.
+"""Transactional Claude Desktop / Claude Code provider switcher.
 
-This is the Claude branch of the unified Codex & Claude Code model switcher.
-It manages the user-level Claude Code persistent configuration
-(``~/.claude/settings.json``), which is honored both by a standalone
-``claude`` CLI and by the Claude Code engine bundled inside the Claude
-Desktop app (the Desktop passes ``setting-sources=user`` to that engine).
-
-DeepSeek connectivity uses DeepSeek's native Anthropic-compatible endpoint
-(``https://api.deepseek.com/anthropic``) directly — never the Codex proxy.
-
-Two configuration layers are managed together so the switch actually takes
-effect for the Claude Desktop app (the primary target):
-
-1. ``~/.claude/settings.json`` — official user config for the Claude Code
-   engine (env + apiKeyHelper).  Also covers a standalone ``claude`` CLI.
-2. ``~/Library/Application Support/Claude/developer_settings.json`` — the
-   Claude Desktop "Developer Mode" / Custom 3p provider config.  In DeepSeek
-   mode the Desktop provider becomes a gateway pointing at DeepSeek's
-   Anthropic-compatible endpoint, with a credential helper backed by the
-   macOS Keychain and a model list whose entries carry Anthropic family
-   tiers (opus -> DeepSeek V4 Pro, sonnet/haiku -> DeepSeek V4 Flash).  The
-   switcher reorders the list so the requested mode is the default entry.
-   The Desktop reads this file at app start, which is why the GUI restarts
-   Claude Desktop after a switch (like it does for Codex).
-
-Model mapping follows DeepSeek's official Claude mapping: requests that carry
-``claude-opus*`` model ids resolve to DeepSeek V4 Pro, and ``claude-sonnet*`` /
-``claude-haiku*`` ids resolve to DeepSeek V4 Flash.  We therefore configure
-canonical Anthropic model ids (``claude-opus-5`` / ``claude-sonnet-5``) and
-let DeepSeek do the mapping server-side.
-
-Security rules:
-
-* The DeepSeek API key lives only in the macOS Keychain under the service
-  ``claude-code-deepseek-api-key`` (independent of the Codex service).
-* ``settings.json`` never contains the key.  Instead the official Claude Code
-  ``apiKeyHelper`` setting runs ``/usr/bin/security ... -w`` at request time.
-* Only the ``env`` object and ``apiKeyHelper`` are touched; permissions,
-  hooks, MCP servers, plugins, projects and everything else are preserved.
-* Writes are atomic; every switch is backed up first; failures roll back;
-  a lock prevents concurrent switches; the result is verified after writing.
-* When switching to DeepSeek, the current macOS HTTP/HTTPS system proxy
-  (``/usr/sbin/scutil --proxy``, same parsing design as the Codex bridge)
-  is written dynamically into ``env.HTTP_PROXY`` / ``env.HTTPS_PROXY`` so
-  the engine can reach ``api.deepseek.com``.  If no system proxy is
-  configured, no invalid proxy values are generated and any pre-existing
-  user values are kept.  The proxy keys are part of the managed env set,
-  so "Claude 官方" restores the user's original pre-switch values.
+Claude Desktop state comes from its current 3P deployment domain and config
+library.  ~/.claude/settings.json is managed separately for a directly run
+Claude Code CLI and is never accepted as evidence that Desktop switched.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import plistlib
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
 PRO_MODEL = "claude-opus-5"
 FLASH_MODEL = "claude-sonnet-5"
-HAIKU_MODEL = "claude-haiku-4-5-20251001"
 KEYCHAIN_SERVICE = "claude-code-deepseek-api-key"
 KEYCHAIN_ACCOUNT = "deepseek"
-API_KEY_HELPER_COMMAND = (
-    "/usr/bin/security find-generic-password "
-    f"-s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w"
-)
-
 DESKTOP_BUNDLE_ID = "com.anthropic.claudefordesktop"
-DESKTOP_CRED_HELPER_DEFAULT = "~/.codex/bin/claude-gateway-cred-helper"
 
-# Fields this manager owns inside settings.json["env"].
 MANAGED_ENV_KEYS = (
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
@@ -93,11 +42,25 @@ MANAGED_ENV_KEYS = (
     "HTTPS_PROXY",
 )
 
+# Flat keys persisted by the installed Claude Desktop config-library UI.
+DESKTOP_MANAGED_KEYS = (
+    "inferenceProvider",
+    "inferenceGatewayBaseUrl",
+    "inferenceCredentialKind",
+    "inferenceCredentialHelper",
+    "inferenceGatewayAuthScheme",
+    "modelDiscoveryEnabled",
+    "inferenceModels",
+)
+
 MODE_LABELS = {
     "default": "Claude 官方",
     "deepseek-pro": "DeepSeek V4 Pro",
     "deepseek-flash": "DeepSeek V4 Flash",
 }
+
+CONFIG_ID_PATTERN = re.compile(r"^[a-f0-9-]{36}$")
+SNAPSHOT_VERSION = 2
 
 
 class ClaudeProviderError(Exception):
@@ -109,8 +72,7 @@ class ClaudeProviderError(Exception):
 
 
 def resolve_claude_home(
-    env: dict[str, str] | None = None,
-    home: str | None = None,
+    env: dict[str, str] | None = None, home: str | None = None
 ) -> Path:
     env = env if env is not None else dict(os.environ)
     override = (env.get("CODEX_SWITCHER_CLAUDE_HOME") or "").strip()
@@ -120,38 +82,60 @@ def resolve_claude_home(
     return (home_path / ".claude").resolve()
 
 
+def resolve_claude_3p_support(
+    env: dict[str, str] | None = None, home: str | None = None
+) -> Path:
+    env = env if env is not None else dict(os.environ)
+    override = (
+        env.get("CODEX_SWITCHER_CLAUDE_3P_SUPPORT")
+        or env.get("CODEX_SWITCHER_CLAUDE_APP_SUPPORT")
+        or ""
+    ).strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    home_path = Path(home) if home else Path.home()
+    return (home_path / "Library/Application Support/Claude-3p").resolve()
+
+
+# Previous tests/callers used this name.  It now resolves the real 3P domain.
+def resolve_claude_app_support(
+    env: dict[str, str] | None = None, home: str | None = None
+) -> Path:
+    return resolve_claude_3p_support(env, home)
+
+
 def settings_path(claude_home: Path) -> Path:
     return claude_home / "settings.json"
 
 
-def resolve_claude_app_support(
-    env: dict[str, str] | None = None,
-    home: str | None = None,
-) -> Path:
-    env = env if env is not None else dict(os.environ)
-    override = (env.get("CODEX_SWITCHER_CLAUDE_APP_SUPPORT") or "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    home_path = Path(home) if home else Path.home()
-    return (
-        home_path / "Library" / "Application Support" / "Claude"
-    ).resolve()
+def desktop_config_path(claude_3p_support: Path) -> Path:
+    return claude_3p_support / "claude_desktop_config.json"
 
 
-def developer_settings_path(claude_app_support: Path) -> Path:
-    return claude_app_support / "developer_settings.json"
+def config_library_dir(claude_3p_support: Path) -> Path:
+    return claude_3p_support / "configLibrary"
 
 
-def official_state_path(claude_home: Path) -> Path:
-    return claude_home / "claude-official.env.json"
+def config_library_meta_path(claude_3p_support: Path) -> Path:
+    return config_library_dir(claude_3p_support) / "_meta.json"
 
 
-def official_developer_state_path(claude_home: Path) -> Path:
-    return claude_home / "claude-official.developer-settings.json"
+def config_library_entry_path(claude_3p_support: Path, config_id: str) -> Path:
+    if not CONFIG_ID_PATTERN.fullmatch(config_id):
+        raise ClaudeProviderError("Claude Desktop 活动配置 ID 非法")
+    return config_library_dir(claude_3p_support) / f"{config_id}.json"
 
 
 def backup_dir(claude_home: Path) -> Path:
     return claude_home / "provider-switch-backups"
+
+
+def snapshot_root(claude_home: Path) -> Path:
+    return claude_home / "official-config-snapshots"
+
+
+def snapshot_pointer_path(claude_home: Path) -> Path:
+    return claude_home / "claude-official-snapshot.v2.json"
 
 
 def lock_path(claude_home: Path) -> Path:
@@ -159,23 +143,31 @@ def lock_path(claude_home: Path) -> Path:
 
 
 def credential_helper_command(
-    env: dict[str, str] | None = None,
-    home: str | None = None,
+    env: dict[str, str] | None = None, home: str | None = None
 ) -> str:
     env = env if env is not None else dict(os.environ)
     override = (env.get("CODEX_SWITCHER_CLAUDE_CRED_HELPER") or "").strip()
     if override:
         return str(Path(override).expanduser().resolve())
     home_path = Path(home) if home else Path.home()
-    return str((home_path / ".codex/bin/claude-gateway-cred-helper").resolve())
+    return str((home_path / ".claude/deepseek-keychain-helper").resolve())
 
 
 # ---------------------------------------------------------------------------
-# JSON handling
+# Durable JSON/file handling
 
 
-def atomic_write_json(path: Path, data: Any) -> None:
-    atomic_write_bytes(path, json.dumps(data, ensure_ascii=False, indent=2).encode() + b"\n")
+def _json_bytes(data: Any) -> bytes:
+    return json.dumps(data, ensure_ascii=False, indent=2).encode() + b"\n"
+
+
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(str(directory), flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -190,24 +182,50 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary_name, 0o600)
         os.replace(temporary_name, path)
+        _fsync_directory(path.parent)
     except BaseException:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
         raise
 
 
-def read_settings(path: Path) -> dict[str, Any]:
-    """Return the parsed settings object, or {} when the file does not exist."""
+def atomic_write_json(path: Path, data: Any) -> None:
+    atomic_write_bytes(path, _json_bytes(data))
+
+
+def atomic_remove(path: Path) -> None:
+    if not path.exists():
+        return
+    tombstone = path.parent / f".{path.name}.deleted-{os.getpid()}-{time.time_ns()}"
+    os.replace(path, tombstone)
+    _fsync_directory(path.parent)
+    try:
+        tombstone.unlink()
+        _fsync_directory(path.parent)
+    except BaseException:
+        if tombstone.exists() and not path.exists():
+            os.replace(tombstone, path)
+            _fsync_directory(path.parent)
+        raise
+
+
+def read_json_object(path: Path, label: str) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
         with path.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
     except json.JSONDecodeError as exc:
-        raise ClaudeProviderError(f"settings.json 不是合法 JSON：{exc}") from exc
+        raise ClaudeProviderError(f"{label} 不是合法 JSON：{exc}") from exc
+    except OSError as exc:
+        raise ClaudeProviderError(f"无法读取 {label}：{exc}") from exc
     if not isinstance(data, dict):
-        raise ClaudeProviderError("settings.json 顶层必须是 JSON 对象")
+        raise ClaudeProviderError(f"{label} 顶层必须是 JSON 对象")
     return data
+
+
+def read_settings(path: Path) -> dict[str, Any]:
+    return read_json_object(path, "settings.json")
 
 
 def env_of(settings: dict[str, Any]) -> dict[str, str]:
@@ -225,18 +243,10 @@ def helper_of(settings: dict[str, Any]) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# macOS system proxy (same parsing design as Support/deepseek_responses_proxy.py)
+# macOS system proxy
 
 
 def parse_scutil_proxy_output(text: str) -> dict[str, str]:
-    """Parse ``scutil --proxy`` output into HTTP_PROXY / HTTPS_PROXY values.
-
-    Mirrors ``parse_macos_proxy_settings`` from the Codex bridge: a proxy is
-    only emitted when it is enabled, has a host, and has a valid port.
-    IPv6 hosts are bracketed.  The endpoint fallback matches the bridge
-    (https uses the http endpoint when no https proxy is configured, and
-    vice versa).
-    """
     values: dict[str, str] = {}
     for line in text.splitlines():
         match = re.match(r"^\s*([A-Za-z]+)\s*:\s*(.*?)\s*$", line)
@@ -258,42 +268,32 @@ def parse_scutil_proxy_output(text: str) -> dict[str, str]:
 
     http_endpoint = endpoint("HTTP")
     https_endpoint = endpoint("HTTPS")
-    env: dict[str, str] = {}
-    http_proxy = http_endpoint or https_endpoint
-    https_proxy = https_endpoint or http_endpoint
-    if http_proxy:
-        env["HTTP_PROXY"] = http_proxy
-    if https_proxy:
-        env["HTTPS_PROXY"] = https_proxy
-    return env
+    result: dict[str, str] = {}
+    if http_endpoint or https_endpoint:
+        result["HTTP_PROXY"] = http_endpoint or https_endpoint or ""
+        result["HTTPS_PROXY"] = https_endpoint or http_endpoint or ""
+    return result
 
 
 def read_system_proxy_env() -> dict[str, str]:
-    """Read the current macOS HTTP/HTTPS system proxy via scutil.
-
-    Never raises; returns {} when there is no system proxy, scutil is
-    unavailable, or the lookup fails.
-    """
     if sys.platform != "darwin" or not os.path.isfile("/usr/sbin/scutil"):
         return {}
     try:
         result = subprocess.run(
             ["/usr/sbin/scutil", "--proxy"],
-            check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=3,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return {}
-    if result.returncode != 0:
-        return {}
-    return parse_scutil_proxy_output(result.stdout)
+    return parse_scutil_proxy_output(result.stdout) if result.returncode == 0 else {}
 
 
 # ---------------------------------------------------------------------------
-# DeepSeek environment model mapping
+# Direct Claude Code CLI config
 
 
 def deepseek_env(model: str) -> dict[str, str]:
@@ -302,45 +302,248 @@ def deepseek_env(model: str) -> dict[str, str]:
         "ANTHROPIC_MODEL": model,
         "ANTHROPIC_DEFAULT_OPUS_MODEL": PRO_MODEL,
         "ANTHROPIC_DEFAULT_SONNET_MODEL": FLASH_MODEL,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": HAIKU_MODEL,
-        "ANTHROPIC_SMALL_FAST_MODEL": HAIKU_MODEL,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": FLASH_MODEL,
+        "ANTHROPIC_SMALL_FAST_MODEL": FLASH_MODEL,
         "CLAUDE_CODE_SUBAGENT_MODEL": model,
     }
 
 
 def model_for_mode(mode: str) -> str | None:
-    if mode == "deepseek-pro":
-        return PRO_MODEL
-    if mode == "deepseek-flash":
-        return FLASH_MODEL
-    return None
+    return {"deepseek-pro": PRO_MODEL, "deepseek-flash": FLASH_MODEL}.get(mode)
 
 
 def classify_env(env: dict[str, str]) -> tuple[str, str, bool, str]:
-    """Return (state, label, consistent, reason) for a settings ``env`` dict."""
-    base = env.get("ANTHROPIC_BASE_URL")
+    if env.get("ANTHROPIC_BASE_URL") != DEEPSEEK_ANTHROPIC_BASE_URL:
+        return "default", MODE_LABELS["default"], True, ""
     model = env.get("ANTHROPIC_MODEL")
-    if base == DEEPSEEK_ANTHROPIC_BASE_URL:
-        if model and model.startswith("claude-opus"):
-            return "deepseek-pro", "DeepSeek V4 Pro", True, ""
-        if model and (
-            model.startswith("claude-sonnet") or model.startswith("claude-haiku")
-        ):
-            return "deepseek-flash", "DeepSeek V4 Flash", True, ""
-        return (
-            "inconsistent",
-            "配置不一致",
-            False,
-            f"base_url 指向 DeepSeek 但模型未知：{model or '(空)'}",
-        )
-    # No DeepSeek base URL: this is the official Anthropic configuration.
-    # The user's own model preferences (e.g. ANTHROPIC_MODEL) are their
-    # business and are preserved/restored as-is.
-    return "default", "Claude 官方", True, ""
+    if model == PRO_MODEL:
+        return "deepseek-pro", MODE_LABELS["deepseek-pro"], True, ""
+    if model == FLASH_MODEL:
+        return "deepseek-flash", MODE_LABELS["deepseek-flash"], True, ""
+    return (
+        "inconsistent",
+        "配置不一致",
+        False,
+        f"直接 CLI 指向 DeepSeek，但默认模型不是 {PRO_MODEL}/{FLASH_MODEL}",
+    )
+
+
+def apply_deepseek_settings(
+    settings: dict[str, Any],
+    mode: str,
+    helper_command: str,
+    proxy_env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    model = model_for_mode(mode)
+    if model is None:
+        raise ClaudeProviderError(f"未知模式：{mode}")
+    proxy_env = read_system_proxy_env() if proxy_env is None else proxy_env
+    updated = dict(settings)
+    env = env_of(updated)
+    env.update(deepseek_env(model))
+    for key in ("HTTP_PROXY", "HTTPS_PROXY"):
+        if proxy_env.get(key):
+            env[key] = proxy_env[key]
+    updated["env"] = env
+    updated["apiKeyHelper"] = helper_command
+    return updated
+
+
+def restore_official_settings(
+    settings: dict[str, Any], baseline: dict[str, Any]
+) -> dict[str, Any]:
+    updated = dict(settings)
+    env = env_of(updated)
+    baseline_env = env_of(baseline)
+    for key in MANAGED_ENV_KEYS:
+        if key in baseline_env:
+            env[key] = baseline_env[key]
+        else:
+            env.pop(key, None)
+    if env:
+        updated["env"] = env
+    else:
+        updated.pop("env", None)
+    if "apiKeyHelper" in baseline:
+        updated["apiKeyHelper"] = baseline["apiKeyHelper"]
+    else:
+        updated.pop("apiKeyHelper", None)
+    return updated
 
 
 # ---------------------------------------------------------------------------
-# Detection: Claude Desktop / bundled Claude Code / standalone CLI
+# Claude Desktop current config-library format
+
+
+def _model_entries(mode: str) -> list[dict[str, Any]]:
+    pro = {
+        "anthropicFamilyTier": "opus",
+        "name": PRO_MODEL,
+        "labelOverride": "DeepSeek V4 Pro",
+    }
+    flash = {
+        "anthropicFamilyTier": "sonnet",
+        "name": FLASH_MODEL,
+        "labelOverride": "DeepSeek V4 Flash",
+    }
+    if mode == "deepseek-pro":
+        return [pro, flash]
+    if mode == "deepseek-flash":
+        return [flash, pro]
+    raise ClaudeProviderError(f"未知模式：{mode}")
+
+
+def deepseek_desktop_config(
+    original: dict[str, Any], mode: str, helper_command: str
+) -> dict[str, Any]:
+    updated = dict(original)
+    updated.update(
+        {
+            "inferenceGatewayBaseUrl": DEEPSEEK_ANTHROPIC_BASE_URL,
+            "inferenceCredentialHelper": helper_command,
+            "inferenceModels": _model_entries(mode),
+            "inferenceProvider": "gateway",
+            "inferenceCredentialKind": "helper-script",
+            "inferenceGatewayAuthScheme": "bearer",
+            "modelDiscoveryEnabled": False,
+        }
+    )
+    return updated
+
+
+def _tier_for_model(entry: Any) -> tuple[str, str]:
+    if isinstance(entry, str):
+        tier, name = "", entry
+    elif isinstance(entry, dict):
+        tier = str(entry.get("anthropicFamilyTier") or "")
+        name = str(entry.get("name") or "")
+    else:
+        return "", ""
+    if not tier:
+        tier = "opus" if name == PRO_MODEL else "sonnet" if name == FLASH_MODEL else ""
+    return tier, name
+
+
+def classify_desktop_config(
+    config: dict[str, Any], expected_helper: str
+) -> tuple[str, str, bool, str, str]:
+    """Return state, default model, consistent, reason, effective auth scheme."""
+    if config.get("inferenceProvider") != "gateway":
+        return "official", "", True, "", ""
+    if config.get("inferenceGatewayBaseUrl") != DEEPSEEK_ANTHROPIC_BASE_URL:
+        return "inconsistent", "", False, "Desktop Gateway URL 不正确", ""
+    if config.get("inferenceCredentialKind") != "helper-script":
+        return "inconsistent", "", False, "Desktop Credential 不是 Helper script", ""
+    if str(config.get("inferenceCredentialHelper") or "") != expected_helper:
+        return "inconsistent", "", False, "Desktop Helper 路径与已验证配置不一致", ""
+    auth_scheme = str(config.get("inferenceGatewayAuthScheme") or "bearer")
+    if auth_scheme != "bearer":
+        return "inconsistent", "", False, "Desktop auth scheme 不是 bearer", auth_scheme
+    if config.get("modelDiscoveryEnabled") not in (None, False):
+        return "inconsistent", "", False, "Desktop Model discovery 未关闭", auth_scheme
+    entries = config.get("inferenceModels")
+    if not isinstance(entries, list) or not entries:
+        return "inconsistent", "", False, "Desktop 模型列表为空", auth_scheme
+    mapped = {_tier_for_model(entry) for entry in entries}
+    if ("opus", PRO_MODEL) not in mapped or ("sonnet", FLASH_MODEL) not in mapped:
+        return "inconsistent", "", False, "Desktop 模型列表缺少 Opus/Sonnet 映射", auth_scheme
+    tier, model = _tier_for_model(entries[0])
+    if (tier, model) == ("opus", PRO_MODEL):
+        return "deepseek-pro", model, True, "", auth_scheme
+    if (tier, model) == ("sonnet", FLASH_MODEL):
+        return "deepseek-flash", model, True, "", auth_scheme
+    return "inconsistent", model, False, "Desktop 模型列表首项不是受支持的默认 tier", auth_scheme
+
+
+def _valid_config_id(value: Any) -> str | None:
+    text = str(value or "")
+    return text if CONFIG_ID_PATTERN.fullmatch(text) else None
+
+
+def _read_desktop_files(
+    support: Path,
+) -> tuple[dict[str, Any], dict[str, Any], str | None, dict[str, Any]]:
+    desktop = read_json_object(
+        desktop_config_path(support), "Claude-3p/claude_desktop_config.json"
+    )
+    meta = read_json_object(
+        config_library_meta_path(support), "Claude-3p/configLibrary/_meta.json"
+    )
+    config_id = _valid_config_id(meta.get("appliedId"))
+    active = (
+        read_json_object(
+            config_library_entry_path(support, config_id),
+            f"Claude-3p/configLibrary/{config_id}.json",
+        )
+        if config_id
+        else {}
+    )
+    return desktop, meta, config_id, active
+
+
+def classify_current(
+    claude_home: Path, support: Path, helper_command: str
+) -> dict[str, str]:
+    reasons: list[str] = []
+    try:
+        settings = read_settings(settings_path(claude_home))
+        cli_state, _, cli_ok, cli_reason = classify_env(env_of(settings))
+        if not cli_ok:
+            reasons.append(cli_reason)
+        cli_helper = helper_of(settings)
+    except ClaudeProviderError as exc:
+        cli_state, cli_helper = "inconsistent", None
+        reasons.append(str(exc))
+
+    try:
+        desktop, _, config_id, active = _read_desktop_files(support)
+        deployment = str(desktop.get("deploymentMode") or "")
+        active_state, default_model, active_ok, active_reason, auth_scheme = (
+            classify_desktop_config(active, helper_command)
+        )
+        if deployment == "1p":
+            desktop_state, desktop_ok = "default", True
+        elif active_state in ("deepseek-pro", "deepseek-flash"):
+            desktop_state, desktop_ok = active_state, active_ok
+        elif deployment == "3p":
+            desktop_state, desktop_ok = "inconsistent", False
+            reasons.append(active_reason or "deploymentMode=3p，但没有可用的活动 3P 配置")
+        elif active_state == "official":
+            desktop_state, desktop_ok = "default", True
+        else:
+            desktop_state, desktop_ok = "inconsistent", False
+            reasons.append(active_reason)
+    except ClaudeProviderError as exc:
+        deployment, config_id, default_model, auth_scheme = "", None, "", ""
+        desktop_state, desktop_ok = "inconsistent", False
+        reasons.append(str(exc))
+
+    if cli_state in ("deepseek-pro", "deepseek-flash") and not cli_helper:
+        cli_state = "inconsistent"
+        reasons.append("直接 CLI 的 apiKeyHelper 缺失")
+    if desktop_ok and cli_state == desktop_state:
+        state, consistent = desktop_state, True
+    else:
+        state, consistent = "inconsistent", False
+        if cli_state != desktop_state:
+            reasons.append(f"Desktop={desktop_state}，直接 CLI={cli_state}")
+    return {
+        "state": state,
+        "label": MODE_LABELS.get(state, "配置不一致"),
+        "consistent": "yes" if consistent else "no",
+        "reason": "；".join(dict.fromkeys(reason for reason in reasons if reason)),
+        "deployment_mode": deployment,
+        "desktop_provider": (
+            "gateway" if desktop_state in ("deepseek-pro", "deepseek-flash") else "anthropic"
+        ),
+        "desktop_default_model": default_model,
+        "desktop_auth_scheme": auth_scheme,
+        "active_config_id": config_id or "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Detection and Keychain checks.  Keychain values are never requested.
 
 
 def _plist_version(plist_path: Path, key: str = "CFBundleShortVersionString") -> str:
@@ -354,50 +557,37 @@ def _plist_version(plist_path: Path, key: str = "CFBundleShortVersionString") ->
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
-    if result.returncode != 0:
-        return ""
-    return (result.stdout or "").strip()
+    return (result.stdout or "").strip() if result.returncode == 0 else ""
 
 
 def detect_claude_desktop() -> tuple[bool, str, str]:
-    """Return (installed, version, app path).  Never raises."""
-    candidates = [
+    for candidate in (
         Path("/Applications/Claude.app"),
-        Path.home() / "Applications" / "Claude.app",
-    ]
-    for candidate in candidates:
-        info = candidate / "Contents" / "Info.plist"
-        if not candidate.is_dir() or not info.is_file():
-            continue
-        version = _plist_version(info)
-        if version:
-            return True, version, str(candidate)
+        Path.home() / "Applications/Claude.app",
+    ):
+        info = candidate / "Contents/Info.plist"
+        if candidate.is_dir() and info.is_file():
+            version = _plist_version(info)
+            if version:
+                return True, version, str(candidate)
     return False, "", ""
 
 
 def detect_bundled_claude_code() -> tuple[bool, str, str]:
-    """Detect the Claude Code engine bundled inside the Claude Desktop app.
-
-    Return (installed, version, binary path).
-    """
-    support = Path.home() / "Library" / "Application Support" / "Claude"
-    code_root = support / "claude-code"
-    if not code_root.is_dir():
-        return False, "", ""
-    versions = sorted(
-        (entry for entry in code_root.iterdir() if entry.is_dir()),
-        key=lambda entry: tuple(
-            int(part) if part.isdigit() else part for part in entry.name.split(".")
-        ),
-        reverse=True,
+    roots = (
+        Path.home() / "Library/Application Support/Claude-3p/claude-code",
+        Path.home() / "Library/Application Support/Claude/claude-code",
     )
-    for version_dir in versions:
-        binary = version_dir / "claude.app" / "Contents" / "MacOS" / "claude"
-        if binary.is_file() and os.access(binary, os.X_OK):
-            version = _plist_version(
-                version_dir / "claude.app" / "Contents" / "Info.plist"
-            ) or version_dir.name
-            return True, version, str(binary)
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for version_dir in sorted(root.iterdir(), reverse=True):
+            binary = version_dir / "claude.app/Contents/MacOS/claude"
+            if binary.is_file() and os.access(binary, os.X_OK):
+                version = _plist_version(
+                    version_dir / "claude.app/Contents/Info.plist"
+                ) or version_dir.name
+                return True, version, str(binary)
     return False, "", ""
 
 
@@ -412,35 +602,28 @@ def _try_version(binary: str) -> str:
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
-    if result.returncode != 0:
-        return ""
     output = (result.stdout or "").strip()
-    return output.splitlines()[0][:200] if output else ""
+    return output.splitlines()[0][:200] if result.returncode == 0 and output else ""
 
 
 def _is_managed_wrapper(binary: str) -> bool:
     try:
         with open(binary, "r", encoding="utf-8", errors="replace") as handle:
-            head = handle.read(256)
+            return "claude-provider: managed launch wrapper" in handle.read(256)
     except OSError:
         return False
-    return "claude-provider: managed launch wrapper" in head
 
 
 def detect_claude_cli(claude_home: Path) -> tuple[bool, str, str]:
-    """Detect a standalone ``claude`` CLI (optional compatibility target).
-
-    Our own launch wrapper is never reported as the real CLI.
-    """
     candidates: list[str] = []
     found = shutil.which("claude")
     if found:
         candidates.append(found)
     candidates.extend(
         [
-            str(claude_home / "local" / "claude"),
-            str(Path.home() / ".local" / "bin" / "claude"),
-            str(Path.home() / ".npm-global" / "bin" / "claude"),
+            str(claude_home / "local/claude"),
+            str(Path.home() / ".local/bin/claude"),
+            str(Path.home() / ".npm-global/bin/claude"),
             "/usr/local/bin/claude",
             "/opt/homebrew/bin/claude",
         ]
@@ -451,23 +634,25 @@ def detect_claude_cli(claude_home: Path) -> tuple[bool, str, str]:
         if resolved in seen or not os.path.isfile(resolved):
             continue
         seen.add(resolved)
-        if _is_managed_wrapper(resolved):
+        if _is_managed_wrapper(resolved) or not os.access(resolved, os.X_OK):
             continue
-        if not os.access(resolved, os.X_OK):
-            continue
-        version = _try_version(resolved)
-        return True, version, resolved
+        return True, _try_version(resolved), resolved
     return False, "", ""
 
 
-# ---------------------------------------------------------------------------
-# Keychain
-
-
-def keychain_ready(service: str = KEYCHAIN_SERVICE) -> bool:
+def keychain_ready(
+    service: str = KEYCHAIN_SERVICE, account: str = KEYCHAIN_ACCOUNT
+) -> bool:
     try:
         result = subprocess.run(
-            ["/usr/bin/security", "find-generic-password", "-s", service],
+            [
+                "/usr/bin/security",
+                "find-generic-password",
+                "-s",
+                service,
+                "-a",
+                account,
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -477,7 +662,7 @@ def keychain_ready(service: str = KEYCHAIN_SERVICE) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Locking
+# Lock, snapshots, backups, transaction
 
 
 @contextmanager
@@ -486,281 +671,198 @@ def provider_lock(claude_home: Path):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     handle = path.open("a+")
     try:
-        try:
-            import fcntl
+        import fcntl
 
+        try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ClaudeProviderError("另一个 Claude Code 配置切换正在进行中")
-        except ImportError:
-            pass
+        except BlockingIOError as exc:
+            raise ClaudeProviderError("另一个 Claude 配置切换正在进行中") from exc
         yield
     finally:
         try:
             import fcntl
 
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except ImportError:
+        except (ImportError, OSError):
             pass
         handle.close()
 
 
-# ---------------------------------------------------------------------------
-# Official-state capture / restore
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-def save_official_state(claude_home: Path, settings: dict[str, Any]) -> None:
-    """Snapshot the user's non-DeepSeek managed fields so ``default`` can
-    restore them exactly."""
-    env = env_of(settings)
-    state: dict[str, Any] = {
-        "env": {key: env.get(key) for key in MANAGED_ENV_KEYS},
-        "apiKeyHelper": helper_of(settings),
+def _snapshot_file_record(snapshot: Path, tag: str, source: Path) -> dict[str, Any]:
+    if not source.exists():
+        return {"exists": False}
+    data = source.read_bytes()
+    backup_name = f"{tag}.original"
+    atomic_write_bytes(snapshot / backup_name, data)
+    return {"exists": True, "backup": backup_name, "sha256": _sha256(data)}
+
+
+def capture_official_snapshot(
+    claude_home: Path, support: Path, managed_config_id: str
+) -> Path:
+    root = snapshot_root(claude_home)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    name = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}-{time.time_ns()}"
+    snapshot = root / name
+    snapshot.mkdir(mode=0o700)
+    sources = {
+        "settings": settings_path(claude_home),
+        "desktop": desktop_config_path(support),
+        "meta": config_library_meta_path(support),
+        "active": config_library_entry_path(support, managed_config_id),
     }
-    atomic_write_json(official_state_path(claude_home), state)
+    manifest = {
+        "version": SNAPSHOT_VERSION,
+        "managedConfigId": managed_config_id,
+        "files": {
+            tag: _snapshot_file_record(snapshot, tag, source)
+            for tag, source in sources.items()
+        },
+    }
+    atomic_write_json(snapshot / "manifest.json", manifest)
+    atomic_write_json(
+        snapshot_pointer_path(claude_home),
+        {"version": SNAPSHOT_VERSION, "directory": name},
+    )
+    return snapshot
 
 
-def load_official_state(claude_home: Path) -> dict[str, Any]:
-    path = official_state_path(claude_home)
-    if not path.exists():
+def load_official_snapshot(claude_home: Path) -> dict[str, Any] | None:
+    pointer_path = snapshot_pointer_path(claude_home)
+    if not pointer_path.exists():
+        return None
+    pointer = read_json_object(pointer_path, pointer_path.name)
+    if pointer.get("version") != SNAPSHOT_VERSION:
+        raise ClaudeProviderError("Claude 官方配置快照版本不受支持")
+    directory = str(pointer.get("directory") or "")
+    if not directory or Path(directory).name != directory:
+        raise ClaudeProviderError("Claude 官方配置快照路径非法")
+    snapshot = snapshot_root(claude_home) / directory
+    manifest = read_json_object(snapshot / "manifest.json", "官方配置快照 manifest")
+    if manifest.get("version") != SNAPSHOT_VERSION:
+        raise ClaudeProviderError("Claude 官方配置快照 manifest 版本不受支持")
+    records = manifest.get("files")
+    if not isinstance(records, dict):
+        raise ClaudeProviderError("Claude 官方配置快照缺少 files")
+    loaded: dict[str, bytes | None] = {}
+    for tag in ("settings", "desktop", "meta", "active"):
+        record = records.get(tag)
+        if not isinstance(record, dict):
+            raise ClaudeProviderError(f"Claude 官方配置快照缺少 {tag}")
+        if record.get("exists") is not True:
+            loaded[tag] = None
+            continue
+        backup_name = str(record.get("backup") or "")
+        if Path(backup_name).name != backup_name:
+            raise ClaudeProviderError("Claude 官方配置快照文件名非法")
+        data = (snapshot / backup_name).read_bytes()
+        if _sha256(data) != record.get("sha256"):
+            raise ClaudeProviderError(f"Claude 官方配置快照 {tag} 校验失败")
+        loaded[tag] = data
+    config_id = _valid_config_id(manifest.get("managedConfigId"))
+    if not config_id:
+        raise ClaudeProviderError("Claude 官方配置快照缺少活动配置 ID")
+    return {"directory": snapshot, "managed_config_id": config_id, "files": loaded}
+
+
+def _parse_snapshot_object(data: bytes | None, label: str) -> dict[str, Any]:
+    if data is None:
         return {}
-    with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    return data if isinstance(data, dict) else {}
-
-
-def restore_official_settings(
-    settings: dict[str, Any], official: dict[str, Any]
-) -> dict[str, Any]:
-    updated = dict(settings)
-    official_env = official.get("env")
-    env = env_of(updated)
-    if isinstance(official_env, dict):
-        for key in MANAGED_ENV_KEYS:
-            value = official_env.get(key)
-            if value is None:
-                env.pop(key, None)
-            else:
-                env[key] = str(value)
-    else:
-        for key in MANAGED_ENV_KEYS:
-            env.pop(key, None)
-    if env:
-        updated["env"] = env
-    else:
-        updated.pop("env", None)
-    if "apiKeyHelper" in official:
-        if official["apiKeyHelper"] is None:
-            updated.pop("apiKeyHelper", None)
-        else:
-            updated["apiKeyHelper"] = str(official["apiKeyHelper"])
-    else:
-        updated.pop("apiKeyHelper", None)
-    return updated
-
-
-def apply_deepseek_settings(
-    settings: dict[str, Any],
-    mode: str,
-    proxy_env: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    model = model_for_mode(mode)
-    if model is None:
-        raise ClaudeProviderError(f"未知模式：{mode}")
-    if proxy_env is None:
-        proxy_env = read_system_proxy_env()
-    updated = dict(settings)
-    env = env_of(updated)
-    env.update(deepseek_env(model))
-    # Write the dynamically detected system proxy; when no system proxy
-    # exists we generate nothing and keep any pre-existing user values.
-    for key, value in proxy_env.items():
-        if value:
-            env[key] = value
-    updated["env"] = env
-    updated["apiKeyHelper"] = API_KEY_HELPER_COMMAND
-    return updated
-
-
-# ---------------------------------------------------------------------------
-# Claude Desktop Developer Mode / Custom 3p provider configuration
-
-
-def deepseek_developer_settings(
-    mode: str, helper_command: str
-) -> dict[str, Any]:
-    """Build the developer_settings.json ``inference`` + ``models`` blocks.
-
-    Model entries use Anthropic canonical model ids; DeepSeek maps them
-    server-side (claude-opus* -> V4 Pro, claude-sonnet*/haiku* -> V4 Flash).
-    The ``anthropicFamilyTier`` pins the Desktop's opus/sonnet/haiku aliases,
-    and the requested mode's model is placed first so it is the default.
-    """
-    entries = [
-        {
-            "name": PRO_MODEL,
-            "labelOverride": "DeepSeek V4 Pro",
-            "anthropicFamilyTier": "opus",
-            "isFamilyDefault": True,
-        },
-        {
-            "name": FLASH_MODEL,
-            "labelOverride": "DeepSeek V4 Flash",
-            "anthropicFamilyTier": "sonnet",
-            "isFamilyDefault": True,
-        },
-        {
-            "name": HAIKU_MODEL,
-            "labelOverride": "DeepSeek V4 Flash · Haiku",
-            "anthropicFamilyTier": "haiku",
-            "isFamilyDefault": True,
-        },
-    ]
-    if mode == "deepseek-flash":
-        entries = [entries[1], entries[0], entries[2]]
-    return {
-        "inference": {
-            "provider": "gateway",
-            "baseUrl": DEEPSEEK_ANTHROPIC_BASE_URL,
-            "credential": {
-                "kind": "helper-script",
-                "command": helper_command,
-                "authScheme": "bearer",
-            },
-        },
-        "models": {
-            "discoveryEnabled": False,
-            "list": entries,
-        },
-    }
-
-
-def classify_developer_settings(
-    developer: dict[str, Any],
-) -> tuple[str, str, str, str]:
-    """Classify a developer_settings.json object.
-
-    Return (provider_state, default_tier, default_model, reason) where
-    provider_state is "deepseek" / "official" / "unknown".
-    """
-    if not isinstance(developer, dict):
-        return "unknown", "", "", "developer_settings.json 顶层必须是 JSON 对象"
-    inference = developer.get("inference")
-    if not isinstance(inference, dict):
-        return "official", "", "", ""
-    provider = inference.get("provider")
-    base = inference.get("baseUrl") or ""
-    if provider == "gateway" and base == DEEPSEEK_ANTHROPIC_BASE_URL:
-        models = developer.get("models")
-        default_model = ""
-        default_tier = ""
-        if isinstance(models, dict):
-            entries = models.get("list")
-            if isinstance(entries, list) and entries:
-                first = entries[0]
-                if isinstance(first, dict):
-                    default_model = str(first.get("name") or "")
-                    default_tier = str(first.get("anthropicFamilyTier") or "")
-                else:
-                    default_model = str(first)
-                    if default_model.startswith("claude-opus"):
-                        default_tier = "opus"
-                    elif default_model.startswith("claude-sonnet"):
-                        default_tier = "sonnet"
-                    elif default_model.startswith("claude-haiku"):
-                        default_tier = "haiku"
-        if default_tier == "opus":
-            return "deepseek", "opus", default_model, ""
-        if default_tier in ("sonnet", "haiku"):
-            return "deepseek", "flash", default_model, ""
-        return (
-            "deepseek",
-            "unknown",
-            default_model,
-            "Desktop 模型列表缺少 opus/sonnet/haiku 家族标注",
-        )
-    if provider in ("anthropic", "bedrock", "vertex", "foundry", "mantle"):
-        return "official", "", "", ""
-    return "unknown", "", "", f"未知的 inference.provider：{provider}"
-
-
-def combined_classify(
-    settings_env: dict[str, str],
-    developer: dict[str, Any],
-) -> tuple[str, str, bool, str]:
-    """Classify the two config layers together.
-
-    ``~/.claude/settings.json`` is the single source of truth for the Claude
-    Code DeepSeek state: a working engine must not be reported as
-    "inconsistent" merely because the optional Desktop developer config does
-    not carry DeepSeek ``inference``/``models`` blocks (it can contain only
-    ``{"allowDevTools": true}`` or user-managed content and still work).
-    The developer config is surfaced separately in the status output as
-    optional Desktop-layer information.
-    """
-    env_state, env_label, env_consistent, env_reason = classify_env(settings_env)
-    if env_state == "inconsistent":
-        return env_state, env_label, False, env_reason
-    if env_state == "default":
-        return "default", "Claude 官方", True, ""
-    return env_state, env_label, True, ""
-
-
-def save_official_developer_state(
-    claude_home: Path, dev_path: Path
-) -> None:
-    snapshot_path = official_developer_state_path(claude_home)
-    if dev_path.exists():
-        atomic_write_bytes(snapshot_path, dev_path.read_bytes())
-    else:
-        atomic_write_json(snapshot_path, {"__absent__": True})
-
-
-def restore_official_developer_state(
-    claude_home: Path, dev_path: Path
-) -> None:
-    snapshot_path = official_developer_state_path(claude_home)
-    if not snapshot_path.exists():
-        return
     try:
-        parsed = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        parsed = None
-    if isinstance(parsed, dict) and parsed.get("__absent__") is True:
-        if dev_path.exists():
-            dev_path.unlink()
-        return
-    atomic_write_bytes(dev_path, snapshot_path.read_bytes())
+        value = json.loads(data.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ClaudeProviderError(f"官方快照中的 {label} 无效") from exc
+    if not isinstance(value, dict):
+        raise ClaudeProviderError(f"官方快照中的 {label} 顶层不是对象")
+    return value
 
 
-# ---------------------------------------------------------------------------
-# Backups / switch / status
+def _restore_keys(
+    current: dict[str, Any], baseline: dict[str, Any], keys: tuple[str, ...]
+) -> dict[str, Any]:
+    updated = dict(current)
+    for key in keys:
+        if key in baseline:
+            updated[key] = baseline[key]
+        else:
+            updated.pop(key, None)
+    return updated
 
 
-def make_backup(claude_home: Path, settings_path_: Path, mode: str) -> str | None:
-    if not settings_path_.exists():
-        return None
+def _make_backup(claude_home: Path, path: Path, tag: str, data: bytes) -> Path:
     directory = backup_dir(claude_home)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
-    target = directory / f"settings.json.{stamp}.before-{mode}.bak"
-    shutil.copy2(settings_path_, target)
-    os.chmod(target, 0o600)
-    return str(target)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}-{time.time_ns()}"
+    target = directory / f"{tag}.{stamp}.bak"
+    atomic_write_bytes(target, data)
+    return target
 
 
-def make_file_backup(
-    claude_home: Path, path: Path, mode: str, tag: str
-) -> str | None:
-    if not path.exists():
-        return None
-    directory = backup_dir(claude_home)
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
-    target = directory / f"{tag}.{stamp}.before-{mode}.bak"
-    shutil.copy2(path, target)
-    os.chmod(target, 0o600)
-    return str(target)
+def _commit_transaction(
+    claude_home: Path,
+    actions: dict[Path, bytes | None],
+    verify: Callable[[], None],
+) -> list[Path]:
+    originals = {
+        path: path.read_bytes() if path.exists() else None for path in actions
+    }
+    changed = {
+        path: expected
+        for path, expected in actions.items()
+        if originals[path] != expected
+    }
+    if not changed:
+        verify()
+        return []
+    backups: list[Path] = []
+    for index, (path, original) in enumerate(changed.items()):
+        if original is not None:
+            backups.append(
+                _make_backup(claude_home, path, f"{index}-{path.name}", original)
+            )
+    try:
+        for path, expected in changed.items():
+            atomic_remove(path) if expected is None else atomic_write_bytes(path, expected)
+        for path, expected in changed.items():
+            actual = path.read_bytes() if path.exists() else None
+            if actual != expected:
+                raise ClaudeProviderError(f"写后校验失败：{path}")
+        verify()
+    except BaseException as exc:
+        rollback_errors: list[str] = []
+        for path, original in reversed(list(originals.items())):
+            try:
+                atomic_remove(path) if original is None else atomic_write_bytes(path, original)
+            except BaseException as rollback_exc:
+                rollback_errors.append(f"{path}: {rollback_exc}")
+        if rollback_errors:
+            raise ClaudeProviderError(
+                f"切换失败且回滚不完整：{exc}；" + "；".join(rollback_errors)
+            ) from exc
+        raise
+    return backups
+
+
+def _select_config_id(meta: dict[str, Any]) -> str:
+    return _valid_config_id(meta.get("appliedId")) or str(uuid.uuid4())
+
+
+def _meta_with_active_config(meta: dict[str, Any], config_id: str) -> dict[str, Any]:
+    updated = dict(meta)
+    entries = updated.get("entries")
+    safe_entries = list(entries) if isinstance(entries, list) else []
+    if not any(
+        isinstance(item, dict) and item.get("id") == config_id
+        for item in safe_entries
+    ):
+        safe_entries.append({"id": config_id, "name": "Codex 模型切换器 · DeepSeek"})
+    updated["appliedId"] = config_id
+    updated["entries"] = safe_entries
+    return updated
 
 
 def switch_mode(
@@ -768,249 +870,173 @@ def switch_mode(
     claude_home: Path,
     *,
     require_keychain: bool = True,
+    require_helper: bool = True,
+    claude_3p_support: Path | None = None,
     claude_app_support: Path | None = None,
     helper_command: str | None = None,
     proxy_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     if mode not in MODE_LABELS:
         raise ClaudeProviderError(f"未知模式：{mode}")
-    app_support = (
-        claude_app_support
-        if claude_app_support is not None
-        else resolve_claude_app_support()
-    )
-    dev_path = developer_settings_path(app_support)
-    helper = helper_command if helper_command is not None else credential_helper_command()
+    support = claude_3p_support or claude_app_support or resolve_claude_3p_support()
+    helper = helper_command or credential_helper_command()
+    if mode != "default" and require_keychain and not keychain_ready():
+        raise ClaudeProviderError(
+            f"缺少独立 Keychain 凭据：service={KEYCHAIN_SERVICE}, account={KEYCHAIN_ACCOUNT}"
+        )
+    if mode != "default" and require_helper:
+        if not os.path.isfile(helper) or not os.access(helper, os.X_OK):
+            raise ClaudeProviderError(f"Claude DeepSeek Helper 不存在或不可执行：{helper}")
 
     with provider_lock(claude_home):
         path = settings_path(claude_home)
-        original = read_settings(path)
-        original_env = env_of(original)
-        dev_existed_before = dev_path.exists()
-        try:
-            original_dev = read_settings(dev_path)
-        except ClaudeProviderError:
-            original_dev = {}
-        original_dev_state, _, _, _ = classify_developer_settings(original_dev)
+        desktop_path_ = desktop_config_path(support)
+        meta_path = config_library_meta_path(support)
+        settings = read_settings(path)
+        desktop, meta, _, _ = _read_desktop_files(support)
+        current = classify_current(claude_home, support, helper)
 
-        if mode != "default" and require_keychain and not keychain_ready():
-            raise ClaudeProviderError(
-                "缺少 Keychain 凭据：claude-code-deepseek-api-key。"
-                "请先运行：security add-generic-password -s "
-                "claude-code-deepseek-api-key -a deepseek -w sk-你的-key"
-            )
-
-        # Preserve the user's original official state before the first
-        # DeepSeek switch so "default" can fully restore it later.
         if mode != "default":
-            current_state, _, _, _ = classify_env(original_env)
-            if current_state == "default":
-                save_official_state(claude_home, original)
-            if original_dev_state != "deepseek":
-                save_official_developer_state(claude_home, dev_path)
-
-        if mode == "default":
-            official = load_official_state(claude_home)
-            if not official:
-                # No prior DeepSeek switch: nothing to restore, keep current.
-                new_settings = original
-            else:
-                new_settings = restore_official_settings(original, official)
-        else:
-            new_settings = apply_deepseek_settings(original, mode, proxy_env)
-
-        if mode == "default":
-            # Restore the original developer_settings.json (or delete the
-            # one we created) when the Desktop currently points at DeepSeek.
-            if original_dev_state != "official":
-                new_dev: dict[str, Any] | None = {"__restore__": True}
-            else:
-                new_dev = None
-        else:
-            managed = deepseek_developer_settings(mode, helper)
-            candidate_dev = dict(original_dev)
-            candidate_dev["inference"] = managed["inference"]
-            candidate_dev["models"] = managed["models"]
-            if candidate_dev == original_dev:
-                new_dev = None
-            else:
-                new_dev = candidate_dev
-
-        if new_settings == original and new_dev is None:
-            result: dict[str, str] = {
-                "state": mode,
-                "state_label": MODE_LABELS[mode],
-                "backup": "",
+            config_id = _select_config_id(meta)
+            active_path = config_library_entry_path(support, config_id)
+            active = read_json_object(active_path, f"configLibrary/{config_id}.json")
+            if current["state"] == "default" and current["consistent"] == "yes":
+                capture_official_snapshot(claude_home, support, config_id)
+            new_desktop = dict(desktop)
+            new_desktop["deploymentMode"] = "3p"
+            actions: dict[Path, bytes | None] = {
+                path: _json_bytes(
+                    apply_deepseek_settings(settings, mode, helper, proxy_env)
+                ),
+                desktop_path_: _json_bytes(new_desktop),
+                meta_path: _json_bytes(_meta_with_active_config(meta, config_id)),
+                active_path: _json_bytes(
+                    deepseek_desktop_config(active, mode, helper)
+                ),
             }
-            if mode != "default":
-                for key, out_key in (
-                    ("HTTP_PROXY", "proxy_http"),
-                    ("HTTPS_PROXY", "proxy_https"),
-                ):
-                    value = original_env.get(key, "")
-                    if value:
-                        result[out_key] = value
-            return result
-
-        backup = ""
-        dev_backup = ""
-        try:
-            if new_settings != original:
-                backup = make_backup(claude_home, path, mode) or ""
-                atomic_write_json(path, new_settings)
-
-            if new_dev is not None:
-                dev_backup = (
-                    make_file_backup(claude_home, dev_path, mode, "developer_settings.json")
-                    or ""
+        else:
+            snapshot = load_official_snapshot(claude_home)
+            if snapshot is None:
+                configured_helper = helper_of(settings) or ""
+                needs_cli_cleanup = (
+                    classify_env(env_of(settings))[0] != "default"
+                    or configured_helper == helper
+                    or KEYCHAIN_SERVICE in configured_helper
                 )
-                if isinstance(new_dev, dict) and new_dev.get("__restore__") is True:
-                    restore_official_developer_state(claude_home, dev_path)
-                else:
-                    atomic_write_json(dev_path, new_dev)
+                new_settings = (
+                    restore_official_settings(settings, {})
+                    if needs_cli_cleanup
+                    else settings
+                )
+                new_desktop = dict(desktop)
+                new_desktop["deploymentMode"] = "1p"
+                actions = {
+                    path: _json_bytes(new_settings),
+                    desktop_path_: _json_bytes(new_desktop),
+                }
+            else:
+                files = snapshot["files"]
+                baseline_settings = _parse_snapshot_object(files["settings"], "settings")
+                baseline_desktop = _parse_snapshot_object(files["desktop"], "desktop")
+                baseline_meta = _parse_snapshot_object(files["meta"], "meta")
+                baseline_active = _parse_snapshot_object(files["active"], "active")
+                config_id = str(snapshot["managed_config_id"])
+                active_path = config_library_entry_path(support, config_id)
+                current_active = read_json_object(active_path, f"configLibrary/{config_id}.json")
+                new_settings = restore_official_settings(settings, baseline_settings)
+                new_desktop = _restore_keys(desktop, baseline_desktop, ("deploymentMode",))
+                new_meta = _restore_keys(meta, baseline_meta, ("appliedId", "entries"))
+                new_active = _restore_keys(
+                    current_active, baseline_active, DESKTOP_MANAGED_KEYS
+                )
+                actions = {
+                    path: _json_bytes(new_settings) if new_settings else None,
+                    desktop_path_: _json_bytes(new_desktop) if new_desktop else None,
+                    meta_path: _json_bytes(new_meta) if new_meta else None,
+                    active_path: _json_bytes(new_active) if new_active else None,
+                }
 
-            # Final verification: reload and confirm the result matches.
-            reloaded = read_settings(path)
-            if new_settings != original and reloaded != new_settings:
-                raise ClaudeProviderError("写入后校验失败：settings.json 状态与预期不符")
-            if new_dev is not None:
-                if isinstance(new_dev, dict) and new_dev.get("__restore__") is True:
-                    # Verify the restored bytes match the official snapshot.
-                    snapshot_path = official_developer_state_path(claude_home)
-                    if snapshot_path.exists():
-                        expected_bytes = snapshot_path.read_bytes()
-                        try:
-                            snapshot_parsed = json.loads(
-                                snapshot_path.read_text(encoding="utf-8")
-                            )
-                        except (OSError, json.JSONDecodeError):
-                            snapshot_parsed = None
-                        if (
-                            isinstance(snapshot_parsed, dict)
-                            and snapshot_parsed.get("__absent__") is True
-                        ):
-                            matches = not dev_path.exists()
-                        else:
-                            matches = (
-                                dev_path.exists()
-                                and dev_path.read_bytes() == expected_bytes
-                            )
-                        if not matches:
-                            raise ClaudeProviderError(
-                                "写入后校验失败：developer_settings.json 恢复结果与快照不符"
-                            )
-                else:
-                    reloaded_dev = (
-                        read_settings(dev_path) if dev_path.exists() else {}
-                    )
-                    if reloaded_dev != new_dev:
-                        raise ClaudeProviderError(
-                            "写入后校验失败：developer_settings.json 状态与预期不符"
-                        )
-        except Exception:
-            if backup and Path(backup).exists() and new_settings != original:
-                shutil.copy2(backup, path)
-            if new_dev is not None:
-                if dev_backup and Path(dev_backup).exists():
-                    shutil.copy2(dev_backup, dev_path)
-                elif dev_path.exists() and not dev_existed_before:
-                    dev_path.unlink()
-            raise
+        def verify_target() -> None:
+            final = classify_current(claude_home, support, helper)
+            if final["consistent"] != "yes" or final["state"] != mode:
+                reason = final["reason"] or f"实际状态为 {final['state']}"
+                raise ClaudeProviderError(f"切换后真实配置校验失败：{reason}")
 
-    result: dict[str, str] = {
+        backups = _commit_transaction(claude_home, actions, verify_target)
+    return {
         "state": mode,
         "state_label": MODE_LABELS[mode],
-        "backup": backup or "",
+        "backup": str(backups[0]) if backups else "",
     }
-    if mode != "default":
-        final_env = env_of(new_settings)
-        for key, out_key in (("HTTP_PROXY", "proxy_http"), ("HTTPS_PROXY", "proxy_https")):
-            value = final_env.get(key, "")
-            if value:
-                result[out_key] = value
-    return result
+
+
+# ---------------------------------------------------------------------------
+# Status / CLI
 
 
 def status(
     claude_home: Path,
     *,
+    claude_3p_support: Path | None = None,
     claude_app_support: Path | None = None,
     environment: dict[str, str] | None = None,
+    helper_command: str | None = None,
 ) -> str:
-    path = settings_path(claude_home)
-    app_support = (
-        claude_app_support
-        if claude_app_support is not None
-        else resolve_claude_app_support(environment)
+    support = (
+        claude_3p_support
+        or claude_app_support
+        or resolve_claude_3p_support(environment)
     )
-    dev_path = developer_settings_path(app_support)
-    developer: dict[str, Any] = {}
-    try:
-        settings = read_settings(path)
-        env = env_of(settings)
-        helper = helper_of(settings)
-    except ClaudeProviderError as exc:
-        env, helper = {}, None
-        settings_reason = str(exc)
-    else:
-        settings_reason = ""
-    try:
-        developer = read_settings(dev_path)
-    except ClaudeProviderError as exc:
-        developer = {}
-        developer_reason = str(exc)
-    else:
-        developer_reason = ""
-
-    dev_state, dev_tier, dev_default_model, dev_classify_reason = (
-        classify_developer_settings(developer)
-    )
-    if settings_reason:
-        state, label, consistent, reason = (
-            "inconsistent",
-            "配置不一致",
-            False,
-            settings_reason,
-        )
-    else:
-        # settings.json is the single source of truth for the Claude Code
-        # state; the developer config is optional Desktop-layer info only.
-        state, label, consistent, reason = combined_classify(env, developer)
-
-    desktop_installed, desktop_version, desktop_path = detect_claude_desktop()
+    helper = helper_command or credential_helper_command(environment)
+    current = classify_current(claude_home, support, helper)
+    desktop_installed, desktop_version, desktop_path_ = detect_claude_desktop()
     engine_installed, engine_version, engine_path = detect_bundled_claude_code()
     cli_installed, cli_version, cli_path = detect_claude_cli(claude_home)
     auth = keychain_ready()
-    lines: list[str] = []
-    lines.append(f"current_state={state}")
-    lines.append(f"state_label={label}")
-    lines.append(f"state_consistent={'yes' if consistent else 'no'}")
-    lines.append(f"inconsistency_reason={reason}")
-    lines.append(f"desktop_installed={'yes' if desktop_installed else 'no'}")
-    lines.append(f"desktop_version={desktop_version}")
-    lines.append(f"desktop_path={desktop_path}")
-    lines.append(f"claude_code_installed={'yes' if engine_installed else 'no'}")
-    lines.append(f"claude_code_version={engine_version}")
-    lines.append(f"claude_code_path={engine_path}")
-    lines.append(f"cli_installed={'yes' if cli_installed else 'no'}")
-    lines.append(f"cli_version={cli_version}")
-    lines.append(f"cli_path={cli_path}")
-    lines.append(f"settings_path={path}")
-    lines.append(f"developer_settings_path={dev_path}")
-    lines.append(f"desktop_provider={'gateway' if dev_state == 'deepseek' else ('anthropic' if dev_state == 'official' else 'unknown')}")
-    lines.append(f"desktop_default_model={dev_default_model}")
-    lines.append(f"developer_settings_note={developer_reason or dev_classify_reason}")
-    lines.append(f"base_url={env.get('ANTHROPIC_BASE_URL', '')}")
-    lines.append(f"model={env.get('ANTHROPIC_MODEL', '')}")
-    lines.append(f"env_http_proxy={env.get('HTTP_PROXY', '')}")
-    lines.append(f"env_https_proxy={env.get('HTTPS_PROXY', '')}")
+    helper_ready = os.path.isfile(helper) and os.access(helper, os.X_OK)
+    try:
+        settings = read_settings(settings_path(claude_home))
+        env = env_of(settings)
+        api_helper_present = bool(helper_of(settings))
+    except ClaudeProviderError:
+        env, api_helper_present = {}, False
     system_proxy = read_system_proxy_env()
-    lines.append(f"system_http_proxy={system_proxy.get('HTTP_PROXY', '')}")
-    lines.append(f"system_https_proxy={system_proxy.get('HTTPS_PROXY', '')}")
-    lines.append(f"api_key_helper={'present' if helper else 'absent'}")
-    lines.append(f"auth={'keychain-helper' if auth else 'MISSING'}")
-    lines.append(f"keychain_service={KEYCHAIN_SERVICE}")
-    lines.append(f"backup_dir={backup_dir(claude_home)}")
+    lines = [
+        f"current_state={current['state']}",
+        f"state_label={current['label']}",
+        f"state_consistent={current['consistent']}",
+        f"inconsistency_reason={current['reason']}",
+        f"desktop_installed={'yes' if desktop_installed else 'no'}",
+        f"desktop_version={desktop_version}",
+        f"desktop_path={desktop_path_}",
+        f"claude_code_installed={'yes' if engine_installed else 'no'}",
+        f"claude_code_version={engine_version}",
+        f"claude_code_path={engine_path}",
+        f"cli_installed={'yes' if cli_installed else 'no'}",
+        f"cli_version={cli_version}",
+        f"cli_path={cli_path}",
+        f"settings_path={settings_path(claude_home)}",
+        f"claude_3p_support_path={support}",
+        f"desktop_config_path={desktop_config_path(support)}",
+        f"config_library_meta_path={config_library_meta_path(support)}",
+        f"active_config_id={current['active_config_id']}",
+        f"deployment_mode={current['deployment_mode']}",
+        f"desktop_provider={current['desktop_provider']}",
+        f"desktop_default_model={current['desktop_default_model']}",
+        f"desktop_auth_scheme={current['desktop_auth_scheme']}",
+        f"model_discovery={'disabled' if current['desktop_provider'] == 'gateway' else ''}",
+        f"base_url={env.get('ANTHROPIC_BASE_URL', '')}",
+        f"model={env.get('ANTHROPIC_MODEL', '')}",
+        f"env_http_proxy={env.get('HTTP_PROXY', '')}",
+        f"env_https_proxy={env.get('HTTPS_PROXY', '')}",
+        f"system_http_proxy={system_proxy.get('HTTP_PROXY', '')}",
+        f"system_https_proxy={system_proxy.get('HTTPS_PROXY', '')}",
+        f"api_key_helper={'present' if api_helper_present else 'absent'}",
+        f"helper_ready={'yes' if helper_ready else 'no'}",
+        f"auth={'keychain-helper' if auth else 'MISSING'}",
+        f"keychain_service={KEYCHAIN_SERVICE}",
+        f"backup_dir={backup_dir(claude_home)}",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -1019,47 +1045,28 @@ def main(argv: list[str]) -> int:
 
     parser = argparse.ArgumentParser(prog="claude-provider")
     parser.add_argument(
-        "command",
-        choices=["status", "default", "deepseek-pro", "deepseek-flash"],
+        "command", choices=["status", "default", "deepseek-pro", "deepseek-flash"]
     )
     args = parser.parse_args(argv)
     claude_home = resolve_claude_home()
     if args.command == "status":
-        sys_stdout_write(status(claude_home))
+        sys.stdout.write(status(claude_home))
         return 0
     try:
         result = switch_mode(args.command, claude_home)
     except ClaudeProviderError as exc:
-        sys_stderr_write(f"claude-provider: {exc}\n")
+        sys.stderr.write(f"claude-provider: {exc}\n")
         return 1
-    sys_stdout_write(f"current_state={result['state']}\n")
-    sys_stdout_write(f"state_label={result['state_label']}\n")
+    sys.stdout.write(f"current_state={result['state']}\n")
+    sys.stdout.write(f"state_label={result['state_label']}\n")
     if result["backup"]:
-        sys_stdout_write(f"backup={result['backup']}\n")
-    if result.get("proxy_http"):
-        sys_stdout_write(f"proxy_http={result['proxy_http']}\n")
-    if result.get("proxy_https"):
-        sys_stdout_write(f"proxy_https={result['proxy_https']}\n")
-    sys_stdout_write(
-        "配置切换完成。独立 claude CLI 的新会话立即生效；"
-        "Claude Desktop 需重启后生效（GUI 会自动重启）。\n"
+        sys.stdout.write(f"backup={result['backup']}\n")
+    sys.stdout.write(
+        "配置事务完成并已从真实 Desktop/CLI 配置复核。"
+        "直接 CLI 的新会话立即生效；Claude Desktop 需重启后生效（GUI 会自动重启）。\n"
     )
     return 0
 
 
-def sys_stdout_write(text: str) -> None:
-    import sys
-
-    sys.stdout.write(text)
-
-
-def sys_stderr_write(text: str) -> None:
-    import sys
-
-    sys.stderr.write(text)
-
-
 if __name__ == "__main__":
-    import sys as _sys
-
-    raise SystemExit(main(_sys.argv[1:]))
+    raise SystemExit(main(sys.argv[1:]))

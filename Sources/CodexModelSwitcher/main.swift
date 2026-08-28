@@ -6,7 +6,11 @@ func printToStandardError(_ message: String) {
 }
 
 let codexCommand = CodexProviderCommand(codexDirectory: resolvedCodexDirectory())
-let claudeCommand = ClaudeProviderCommand()
+let bundledClaudeProvider = Bundle.main.url(
+    forResource: "claude-provider",
+    withExtension: nil
+)
+let claudeCommand = ClaudeProviderCommand(executableURL: bundledClaudeProvider)
 let codexAppRestarter = CodexAppRestarter()
 let claudeAppRestarter = CodexAppRestarter(bundleIdentifier: "com.anthropic.claudefordesktop")
 let commandLineArguments = Array(CommandLine.arguments.dropFirst())
@@ -266,12 +270,15 @@ final class SwitcherWindowController: NSObject {
             }
             if claudeStatus.currentMode == .deepSeekPro || claudeStatus.currentMode == .deepSeekFlash {
                 let providerText = claudeStatus.desktopProvider == "gateway"
-                    ? "Desktop Provider：DeepSeek 网关（已接入）"
-                    : "Desktop Provider：未接入 DeepSeek 网关（可选；内置 Claude Code 已通过 settings.json 工作）"
+                    ? "Desktop Provider：DeepSeek Gateway（3P 配置库已接入）"
+                    : "Desktop Provider：未从 Claude-3p 活动配置识别到 DeepSeek Gateway"
                 lines.append(providerText)
             }
             if !claudeStatus.authPresent && claudeStatus.currentMode != .official {
                 lines.append("缺少 Keychain 凭据 claude-code-deepseek-api-key")
+            }
+            if !claudeStatus.helperReady && claudeStatus.currentMode != .official {
+                lines.append("缺少或无法执行 ~/.claude/deepseek-keychain-helper")
             }
             statusLabel.stringValue = lines.joined(separator: "\n")
         }
@@ -340,8 +347,8 @@ final class SwitcherWindowController: NSObject {
                 let modelNote = target == .official
                     ? "Claude Desktop 已恢复官方 Provider。"
                     : "DeepSeek 已接入：请求经 api.deepseek.com/anthropic 直达 DeepSeek。"
-                        + "\(target.displayName) 已设为默认；请在 Claude Desktop 的模型选择器中确认选择"
-                        + "（DeepSeek V4 Pro → Opus 档、DeepSeek V4 Flash → Sonnet/Haiku 档）。"
+                        + "\(target.displayName) 已作为 Claude-3p 活动配置的首个模型："
+                        + "DeepSeek V4 Pro → Opus tier，DeepSeek V4 Flash → Sonnet tier。"
                 showSuccess(
                     title: "已切换到 Claude Code · \(target.displayName)",
                     details: result.output,

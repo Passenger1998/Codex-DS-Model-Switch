@@ -167,6 +167,15 @@ struct ClaudeStatus {
         let model = values["desktop_default_model"] ?? ""
         return model.isEmpty ? nil : model
     }
+
+    var deploymentMode: String? {
+        let mode = values["deployment_mode"] ?? ""
+        return mode.isEmpty ? nil : mode
+    }
+
+    var helperReady: Bool {
+        values["helper_ready"] == "yes"
+    }
 }
 
 struct ProviderCommandResult {

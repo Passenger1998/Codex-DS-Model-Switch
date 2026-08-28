@@ -12,4 +12,5 @@ python3 Tests/ClaudeProviderTests.py
 zsh -n Support/codex-provider Support/claude-wrapper.sh Support/claude-gateway-cred-helper.sh install.sh build.sh
 plutil -lint Sources/CodexModelSwitcher/Info.plist
 codesign --verify --deep --strict "Codex 模型切换器.app"
+test -x "Codex 模型切换器.app/Contents/Resources/claude-provider"
 "Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher" status

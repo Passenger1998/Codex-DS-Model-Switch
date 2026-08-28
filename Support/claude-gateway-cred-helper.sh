@@ -1,6 +1,7 @@
 #!/bin/zsh
-# claude-provider: Claude Desktop gateway credential helper
-# Prints the DeepSeek API key for Claude Code from the macOS Keychain.
+# claude-provider: Claude Desktop / direct CLI credential helper
+# Installed as ~/.claude/deepseek-keychain-helper. Prints the DeepSeek API
+# key for Claude Code from its dedicated macOS Keychain service.
 # The Claude Desktop runs this executable with no arguments and reads stdout
 # (trimmed); exit code must be 0.  The key is never stored in any config
 # file or log.

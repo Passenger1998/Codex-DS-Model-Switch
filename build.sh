@@ -87,6 +87,7 @@ swiftc -swift-version 5 -O \
 cp "$ROOT_DIR/Sources/CodexModelSwitcher/Info.plist" "$CONTENTS_DIR/Info.plist"
 mkdir -p "$CONTENTS_DIR/Resources"
 cp "$ROOT_DIR/Sources/CodexModelSwitcher/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
+install -m 700 "$ROOT_DIR/Support/claude-provider" "$CONTENTS_DIR/Resources/claude-provider"
 printf 'APPL????' > "$CONTENTS_DIR/PkgInfo"
 
 xattr -cr "$STAGED_APP_DIR"
