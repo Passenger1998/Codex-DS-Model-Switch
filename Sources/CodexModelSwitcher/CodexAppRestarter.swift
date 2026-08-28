@@ -47,13 +47,13 @@ enum CodexRestartError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case let .applicationMissing(bundleIdentifier):
-            return "未找到 Codex 桌面应用（Bundle ID: \(bundleIdentifier)）。"
+            return "未找到桌面应用（Bundle ID: \(bundleIdentifier)）。"
         case .terminationTimedOut:
-            return "Codex 未能在限定时间内退出。"
+            return "应用未能在限定时间内退出。"
         case let .relaunchFailed(path):
-            return "无法重新打开 Codex：\n\(path)"
+            return "无法重新打开应用：\n\(path)"
         case .relaunchTimedOut:
-            return "已发出打开 Codex 的请求，但未检测到应用启动。"
+            return "已发出打开应用的请求，但未检测到应用启动。"
         }
     }
 }

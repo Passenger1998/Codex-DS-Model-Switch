@@ -18,8 +18,11 @@ TEST_BINARY="$BUILD_ROOT/ConfigEditorTests"
 
 PYTHONPYCACHEPREFIX="$BUILD_ROOT/pycache" /usr/bin/python3 -m py_compile \
   "$ROOT_DIR/Support/deepseek_responses_proxy.py" \
-  "$ROOT_DIR/Support/install_config.py"
-zsh -n "$ROOT_DIR/Support/codex-provider" "$ROOT_DIR/install.sh"
+  "$ROOT_DIR/Support/install_config.py" \
+  "$ROOT_DIR/Support/claude-provider" \
+  "$ROOT_DIR/Tests/ClaudeProviderTests.py"
+zsh -n "$ROOT_DIR/Support/codex-provider" "$ROOT_DIR/Support/claude-wrapper.sh" \
+  "$ROOT_DIR/Support/claude-gateway-cred-helper.sh" "$ROOT_DIR/install.sh"
 
 cleanup() {
   if [[ "$OLD_APP_MOVED" -eq 1 && ! -e "$APP_DIR" && -e "$PREVIOUS_APP_DIR" ]]; then
@@ -65,7 +68,8 @@ swiftc -swift-version 5 -O \
   -o "$TEST_BINARY" \
   "$ROOT_DIR/Sources/CodexModelSwitcher/ConfigEditor.swift" \
   "$ROOT_DIR/Sources/CodexModelSwitcher/CodexAppRestarter.swift" \
-  "$ROOT_DIR/Tests/ConfigEditorTests.swift"
+  "$ROOT_DIR/Tests/ConfigEditorTests.swift" \
+  "$ROOT_DIR/Tests/ClaudeProviderTests.swift"
 
 "$TEST_BINARY"
 

@@ -270,5 +270,6 @@ struct ConfigEditorTests {
         try testHungCodexUsesForceTerminateFallback()
         try testStoppedCodexIsOpened()
         print("ConfigEditorTests: PASS")
+        try ClaudeProviderTests.run()
     }
 }
