@@ -96,6 +96,25 @@ struct ProviderStatus {
     var isConsistent: Bool {
         values["state_consistent"] == "yes" && currentMode != nil
     }
+
+    var inconsistencyReason: String? {
+        let reason = values["inconsistency_reason"] ?? ""
+        return reason.isEmpty ? nil : reason
+    }
+
+    var credentialProfileID: String? {
+        let value = values["credential_profile_id"] ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    var credentialProfileName: String? {
+        let value = values["credential_profile_name"] ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    var credentialKeyPresent: Bool {
+        values["credential_profile_key"] == "present"
+    }
 }
 
 struct ClaudeStatus {
@@ -175,6 +194,20 @@ struct ClaudeStatus {
 
     var helperReady: Bool {
         values["helper_ready"] == "yes"
+    }
+
+    var credentialProfileID: String? {
+        let value = values["credential_profile_id"] ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    var credentialProfileName: String? {
+        let value = values["credential_profile_name"] ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    var credentialKeyPresent: Bool {
+        values["credential_profile_key"] == "present"
     }
 }
 
@@ -270,8 +303,12 @@ final class CodexProviderCommand {
         try runner.preflight()
     }
 
-    func switchMode(to mode: CodexMode) throws -> ProviderCommandResult {
-        try runner.run(argument: mode.rawValue)
+    func switchMode(to mode: CodexMode, credentialProfileID: String? = nil) throws -> ProviderCommandResult {
+        var arguments = [mode.rawValue]
+        if mode == .deepSeek, let credentialProfileID {
+            arguments += ["--credential", credentialProfileID]
+        }
+        return try runner.run(arguments: arguments)
     }
 
     func status() throws -> ProviderCommandResult {
@@ -298,8 +335,12 @@ final class ClaudeProviderCommand {
         try runner.preflight()
     }
 
-    func switchMode(to mode: ClaudeMode) throws -> ProviderCommandResult {
-        try runner.run(argument: mode.cliArgument)
+    func switchMode(to mode: ClaudeMode, credentialProfileID: String? = nil) throws -> ProviderCommandResult {
+        var arguments = [mode.cliArgument]
+        if mode != .official, let credentialProfileID {
+            arguments += ["--credential", credentialProfileID]
+        }
+        return try runner.run(arguments: arguments)
     }
 
     func status() throws -> ProviderCommandResult {

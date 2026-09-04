@@ -22,12 +22,25 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from credential_profiles import (
+    LEGACY_PROFILE_ID,
+    CredentialProfileError,
+    active_status,
+    load_effective_state,
+    profile_path,
+    resolve_profile,
+    state_bytes as credential_state_bytes,
+    state_with_active,
+)
+
 
 DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
 PRO_MODEL = "claude-opus-5"
 FLASH_MODEL = "claude-sonnet-5"
 KEYCHAIN_SERVICE = "claude-code-deepseek-api-key"
-KEYCHAIN_ACCOUNT = "deepseek"
+KEYCHAIN_ACCOUNT = LEGACY_PROFILE_ID
 DESKTOP_BUNDLE_ID = "com.anthropic.claudefordesktop"
 
 MANAGED_ENV_KEYS = (
@@ -521,12 +534,18 @@ def classify_current(
     if cli_state in ("deepseek-pro", "deepseek-flash") and not cli_helper:
         cli_state = "inconsistent"
         reasons.append("直接 CLI 的 apiKeyHelper 缺失")
+    credential = active_status(
+        "claude", claude_home, lambda service, account: keychain_ready(service, account)
+    )
     if desktop_ok and cli_state == desktop_state:
         state, consistent = desktop_state, True
     else:
         state, consistent = "inconsistent", False
         if cli_state != desktop_state:
             reasons.append(f"Desktop={desktop_state}，直接 CLI={cli_state}")
+    if state in ("deepseek-pro", "deepseek-flash") and credential["valid"] != "yes":
+        state, consistent = "inconsistent", False
+        reasons.append(credential["reason"])
     return {
         "state": state,
         "label": MODE_LABELS.get(state, "配置不一致"),
@@ -539,6 +558,11 @@ def classify_current(
         "desktop_default_model": default_model,
         "desktop_auth_scheme": auth_scheme,
         "active_config_id": config_id or "",
+        "credential_profile_id": credential["id"],
+        "credential_profile_name": credential["name"],
+        "credential_profile_key": credential["key"],
+        "credential_profile_valid": credential["valid"],
+        "credential_profile_reason": credential["reason"],
     }
 
 
@@ -686,6 +710,24 @@ def provider_lock(claude_home: Path):
         except (ImportError, OSError):
             pass
         handle.close()
+
+
+@contextmanager
+def credential_directory_lock(claude_home: Path):
+    """Coordinate Provider transactions with GUI Keychain/profile edits."""
+    claude_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = claude_home / ".provider-switch.lock"
+    try:
+        path.mkdir(parents=False)
+    except FileExistsError as exc:
+        raise ClaudeProviderError("另一个 Credential Profile 或 Provider 事务正在运行") from exc
+    try:
+        yield
+    finally:
+        try:
+            path.rmdir()
+        except OSError:
+            pass
 
 
 def _sha256(data: bytes) -> str:
@@ -875,20 +917,17 @@ def switch_mode(
     claude_app_support: Path | None = None,
     helper_command: str | None = None,
     proxy_env: dict[str, str] | None = None,
+    credential_profile: str | None = None,
 ) -> dict[str, str]:
     if mode not in MODE_LABELS:
         raise ClaudeProviderError(f"未知模式：{mode}")
     support = claude_3p_support or claude_app_support or resolve_claude_3p_support()
     helper = helper_command or credential_helper_command()
-    if mode != "default" and require_keychain and not keychain_ready():
-        raise ClaudeProviderError(
-            f"缺少独立 Keychain 凭据：service={KEYCHAIN_SERVICE}, account={KEYCHAIN_ACCOUNT}"
-        )
     if mode != "default" and require_helper:
         if not os.path.isfile(helper) or not os.access(helper, os.X_OK):
             raise ClaudeProviderError(f"Claude DeepSeek Helper 不存在或不可执行：{helper}")
 
-    with provider_lock(claude_home):
+    with credential_directory_lock(claude_home), provider_lock(claude_home):
         path = settings_path(claude_home)
         desktop_path_ = desktop_config_path(support)
         meta_path = config_library_meta_path(support)
@@ -897,6 +936,20 @@ def switch_mode(
         current = classify_current(claude_home, support, helper)
 
         if mode != "default":
+            try:
+                profile_state, _ = load_effective_state(
+                    "claude",
+                    claude_home,
+                    lambda service, account: keychain_ready(service, account),
+                )
+                selected_profile = resolve_profile(profile_state, credential_profile)
+            except CredentialProfileError as exc:
+                raise ClaudeProviderError(str(exc)) from exc
+            if require_keychain and not keychain_ready(KEYCHAIN_SERVICE, selected_profile["id"]):
+                raise ClaudeProviderError(
+                    f"Credential Profile {selected_profile['displayName']} 的 Keychain 条目缺失"
+                )
+            profile_state = state_with_active(profile_state, selected_profile["id"])
             config_id = _select_config_id(meta)
             active_path = config_library_entry_path(support, config_id)
             active = read_json_object(active_path, f"configLibrary/{config_id}.json")
@@ -913,6 +966,7 @@ def switch_mode(
                 active_path: _json_bytes(
                     deepseek_desktop_config(active, mode, helper)
                 ),
+                profile_path(claude_home): credential_state_bytes(profile_state),
             }
         else:
             snapshot = load_official_snapshot(claude_home)
@@ -967,6 +1021,8 @@ def switch_mode(
         "state": mode,
         "state_label": MODE_LABELS[mode],
         "backup": str(backups[0]) if backups else "",
+        "credential_profile_id": selected_profile["id"] if mode != "default" else "",
+        "credential_profile_name": selected_profile["displayName"] if mode != "default" else "",
     }
 
 
@@ -992,7 +1048,7 @@ def status(
     desktop_installed, desktop_version, desktop_path_ = detect_claude_desktop()
     engine_installed, engine_version, engine_path = detect_bundled_claude_code()
     cli_installed, cli_version, cli_path = detect_claude_cli(claude_home)
-    auth = keychain_ready()
+    auth = current["credential_profile_key"] == "present"
     helper_ready = os.path.isfile(helper) and os.access(helper, os.X_OK)
     try:
         settings = read_settings(settings_path(claude_home))
@@ -1035,6 +1091,11 @@ def status(
         f"helper_ready={'yes' if helper_ready else 'no'}",
         f"auth={'keychain-helper' if auth else 'MISSING'}",
         f"keychain_service={KEYCHAIN_SERVICE}",
+        f"credential_profile_id={current['credential_profile_id']}",
+        f"credential_profile_name={current['credential_profile_name']}",
+        f"credential_profile_key={current['credential_profile_key']}",
+        f"credential_profile_valid={current['credential_profile_valid']}",
+        f"credential_profile_reason={current['credential_profile_reason']}",
         f"backup_dir={backup_dir(claude_home)}",
     ]
     return "\n".join(lines) + "\n"
@@ -1047,13 +1108,16 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "command", choices=["status", "default", "deepseek-pro", "deepseek-flash"]
     )
+    parser.add_argument("--credential", help="Credential Profile ID or display name")
     args = parser.parse_args(argv)
     claude_home = resolve_claude_home()
     if args.command == "status":
         sys.stdout.write(status(claude_home))
         return 0
     try:
-        result = switch_mode(args.command, claude_home)
+        result = switch_mode(
+            args.command, claude_home, credential_profile=args.credential
+        )
     except ClaudeProviderError as exc:
         sys.stderr.write(f"claude-provider: {exc}\n")
         return 1
@@ -1061,6 +1125,9 @@ def main(argv: list[str]) -> int:
     sys.stdout.write(f"state_label={result['state_label']}\n")
     if result["backup"]:
         sys.stdout.write(f"backup={result['backup']}\n")
+    if result["credential_profile_id"]:
+        sys.stdout.write(f"credential_profile_id={result['credential_profile_id']}\n")
+        sys.stdout.write(f"credential_profile_name={result['credential_profile_name']}\n")
     sys.stdout.write(
         "配置事务完成并已从真实 Desktop/CLI 配置复核。"
         "直接 CLI 的新会话立即生效；Claude Desktop 需重启后生效（GUI 会自动重启）。\n"

@@ -2,8 +2,11 @@
 set -euo pipefail
 
 codex_home="${CODEX_SWITCHER_CODEX_HOME:-$HOME/.codex}"
+script_dir="${0:A:h}"
 config_file="$codex_home/config.toml"
 catalog_file="$codex_home/deepseek.models.json"
+profile_file="$codex_home/deepseek-credential-profiles.json"
+profiles_tool="${CODEX_SWITCHER_CREDENTIAL_PROFILES_TOOL:-$script_dir/credential_profiles.py}"
 chatgpt_state="$codex_home/chatgpt.activation.toml"
 backup_dir="$codex_home/provider-switch-backups"
 lock_dir="$codex_home/.provider-switch.lock"
@@ -12,6 +15,7 @@ proxy_label="local.codex-deepseek-proxy"
 proxy_health="http://127.0.0.1:4878/health"
 proxy_upstream_health="http://127.0.0.1:4878/upstream-health"
 launch_domain="gui/$(id -u)"
+curl_bin="${CODEX_SWITCHER_CURL_BIN:-/usr/bin/curl}"
 
 if [[ -n "${CODEX_SWITCHER_CODEX_BIN:-}" ]]; then
   codex_bin="$CODEX_SWITCHER_CODEX_BIN"
@@ -22,8 +26,20 @@ else
 fi
 
 usage() {
-  print -u2 "Usage: codex-provider {chatgpt|deepseek|status}"
+  print -u2 "Usage: codex-provider {chatgpt|deepseek [--credential <profile-id-or-name>]|status}"
   exit 2
+}
+
+fsync_directory() {
+  /usr/bin/python3 -c 'import os, sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)' "$1"
+}
+
+atomic_restore_file() {
+  local source="$1" destination="$2" restore_tmp
+  restore_tmp="$(mktemp "${destination:h}/.${destination:t}.rollback.XXXXXX")"
+  cp -p "$source" "$restore_tmp"
+  mv -f "$restore_tmp" "$destination"
+  fsync_directory "${destination:h}"
 }
 
 root_value() {
@@ -50,15 +66,7 @@ provider_exists() {
 }
 
 proxy_ready() {
-  /usr/bin/curl --noproxy '*' --fail --silent --max-time 2 "$proxy_health" >/dev/null 2>&1
-}
-
-proxy_health_json() {
-  /usr/bin/curl --noproxy '*' --fail --silent --show-error --max-time 3 "$proxy_health"
-}
-
-keychain_ready() {
-  /usr/bin/security find-generic-password -s codex-deepseek-api-key >/dev/null 2>&1
+  "$curl_bin" --noproxy '*' --fail --silent --max-time 2 "$proxy_health" >/dev/null 2>&1
 }
 
 ensure_proxy() {
@@ -77,7 +85,7 @@ ensure_proxy() {
 
 check_upstream() {
   local result elapsed
-  if ! result="$(/usr/bin/curl --noproxy '*' --fail --silent --show-error --max-time 35 \
+  if ! result="$("$curl_bin" --noproxy '*' --fail --silent --show-error --max-time 35 \
       -H 'Authorization: Bearer codex-deepseek-local' "$proxy_upstream_health" 2>&1)"; then
     print -u2 "DeepSeek upstream health check failed: $result"
     return 1
@@ -93,27 +101,44 @@ check_upstream() {
 
 show_status() {
   local active_provider active_model catalog codex_effort
-  local current_state state_label consistent
+  local current_state state_label consistent inconsistency_reason
+  local credential_status credential_valid credential_reason
   active_provider="$(root_value model_provider)"
   active_model="$(root_value model)"
   catalog="$(root_value model_catalog_json)"
   codex_effort="$(root_value model_reasoning_effort)"
   [[ -n "$active_provider" ]] || active_provider=openai
+  if [[ -x "$profiles_tool" ]]; then
+    credential_status="$($profiles_tool status codex "$codex_home")"
+  else
+    credential_status="credential_profile_id=\ncredential_profile_name=\ncredential_profile_valid=no\ncredential_profile_key=missing\ncredential_profile_reason=Credential Profile helper 缺失：$profiles_tool\ncredential_profile_legacy=no"
+  fi
+  credential_valid="$(print -r -- "$credential_status" | awk -F= '$1 == "credential_profile_valid" { print $2 }')"
+  credential_reason="$(print -r -- "$credential_status" | awk -F= '$1 == "credential_profile_reason" { sub(/^[^=]*=/, ""); print }')"
   consistent=yes
+  inconsistency_reason=""
   if [[ "$active_provider" != deepseek ]]; then
     current_state=chatgpt
     state_label="ChatGPT"
-  elif [[ "$active_model" == deepseek-v4-pro ]] && proxy_ready; then
+  elif [[ "$active_model" == deepseek-v4-pro ]] && proxy_ready && [[ "$credential_valid" == yes ]]; then
     current_state=deepseek
     state_label="DeepSeek V4 Pro"
   else
     current_state=inconsistent
     state_label="配置不一致"
     consistent=no
+    if [[ "$active_model" != deepseek-v4-pro ]]; then
+      inconsistency_reason="Codex DeepSeek 模型不是 deepseek-v4-pro"
+    elif ! proxy_ready; then
+      inconsistency_reason="DeepSeek Responses Proxy 未运行"
+    else
+      inconsistency_reason="$credential_reason"
+    fi
   fi
   print "current_state=$current_state"
   print "state_label=$state_label"
   print "state_consistent=$consistent"
+  print "inconsistency_reason=$inconsistency_reason"
   print "provider=$active_provider"
   print "model=${active_model:-built-in-default}"
   print "codex_reasoning_effort=${codex_effort:-built-in-default}"
@@ -122,19 +147,33 @@ show_status() {
   print "service_tier=${$(root_value service_tier):-built-in-default}"
   print "model_catalog=${catalog:-built-in}"
   provider_exists && print "deepseek_provider=present" || print "deepseek_provider=MISSING"
-  keychain_ready && print "deepseek_keychain=present" || print "deepseek_keychain=missing"
+  print -r -- "$credential_status"
+  [[ "$(print -r -- "$credential_status" | awk -F= '$1 == "credential_profile_key" { print $2 }')" == present ]] \
+    && print "deepseek_keychain=present" || print "deepseek_keychain=missing"
   proxy_ready && print "deepseek_proxy=running" || print "deepseek_proxy=stopped"
 }
 
-[[ $# -eq 1 ]] || usage
+[[ $# -ge 1 ]] || usage
 mode="$1"
+shift
+credential_ref=""
 case "$mode" in
   status)
+    [[ $# -eq 0 ]] || usage
     [[ -f "$config_file" ]] || { print -u2 "Missing $config_file"; exit 1; }
     show_status
     exit 0
     ;;
-  chatgpt|deepseek) ;;
+  chatgpt)
+    [[ $# -eq 0 ]] || usage
+    ;;
+  deepseek)
+    if [[ $# -eq 2 && "$1" == --credential ]]; then
+      credential_ref="$2"
+    elif [[ $# -ne 0 ]]; then
+      usage
+    fi
+    ;;
   *) usage ;;
 esac
 
@@ -145,7 +184,7 @@ provider_exists || { print -u2 "Refusing to switch: [model_providers.deepseek] i
 if [[ "$mode" == deepseek ]]; then
   [[ -f "$catalog_file" ]] || { print -u2 "Missing $catalog_file"; exit 1; }
   [[ -f "$proxy_plist" ]] || { print -u2 "Missing DeepSeek proxy LaunchAgent: $proxy_plist"; exit 1; }
-  keychain_ready || { print -u2 "Missing Keychain item: codex-deepseek-api-key"; exit 1; }
+  [[ -x "$profiles_tool" ]] || { print -u2 "Missing Credential Profile helper: $profiles_tool"; exit 1; }
 fi
 
 if ! mkdir "$lock_dir" 2>/dev/null; then
@@ -155,48 +194,72 @@ fi
 
 tmp_prefix=""
 tmp_candidate=""
+tmp_profile=""
+tmp_chatgpt_state=""
 verify_home=""
 config_applied=0
+profile_applied=0
+chatgpt_state_applied=0
 switch_committed=0
 config_backup=""
+profile_backup=""
+profile_existed=0
+chatgpt_state_backup=""
+chatgpt_state_existed=0
 
 cleanup() {
   set +e
   if [[ "$switch_committed" -eq 0 ]]; then
     if [[ "$config_applied" -eq 1 && -n "$config_backup" && -f "$config_backup" ]]; then
-      cp -p "$config_backup" "$config_file"
+      atomic_restore_file "$config_backup" "$config_file"
+    fi
+    if [[ "$profile_applied" -eq 1 ]]; then
+      if [[ "$profile_existed" -eq 1 && -n "$profile_backup" && -f "$profile_backup" ]]; then
+        atomic_restore_file "$profile_backup" "$profile_file"
+      else
+        rm -f "$profile_file"
+        fsync_directory "${profile_file:h}"
+      fi
+    fi
+    if [[ "$chatgpt_state_applied" -eq 1 ]]; then
+      if [[ "$chatgpt_state_existed" -eq 1 && -n "$chatgpt_state_backup" && -f "$chatgpt_state_backup" ]]; then
+        atomic_restore_file "$chatgpt_state_backup" "$chatgpt_state"
+      else
+        rm -f "$chatgpt_state"
+        fsync_directory "${chatgpt_state:h}"
+      fi
     fi
   fi
   [[ -n "$tmp_prefix" && -e "$tmp_prefix" ]] && rm -f "$tmp_prefix"
   [[ -n "$tmp_candidate" && -e "$tmp_candidate" ]] && rm -f "$tmp_candidate"
+  [[ -n "$tmp_profile" && -e "$tmp_profile" ]] && rm -f "$tmp_profile"
+  [[ -n "$tmp_chatgpt_state" && -e "$tmp_chatgpt_state" ]] && rm -f "$tmp_chatgpt_state"
   [[ -n "$verify_home" && -d "$verify_home" ]] && rm -rf "$verify_home"
   rmdir "$lock_dir" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-mkdir -p "$backup_dir"
-chmod 700 "$backup_dir"
-stamp="$(date '+%Y%m%d-%H%M%S')-$$"
-config_backup="$backup_dir/config.toml.$stamp.before-$mode.bak"
-cp -p "$config_file" "$config_backup"
-
 current_provider="$(root_value model_provider)"
 if [[ "$mode" == deepseek && "$current_provider" != deepseek ]]; then
-  state_tmp="$(mktemp "$codex_home/.chatgpt.activation.toml.XXXXXX")"
+  tmp_chatgpt_state="$(mktemp "$codex_home/.chatgpt.activation.toml.candidate.XXXXXX")"
   awk '
     /^[[:space:]]*\[/ { exit }
     /^[[:space:]]*model[[:space:]]*=/ { print }
     /^[[:space:]]*model_reasoning_effort[[:space:]]*=/ { print }
     /^[[:space:]]*service_tier[[:space:]]*=/ { print }
-  ' "$config_file" > "$state_tmp"
-  chmod 600 "$state_tmp"
-  mv -f "$state_tmp" "$chatgpt_state"
+  ' "$config_file" > "$tmp_chatgpt_state"
+  chmod 600 "$tmp_chatgpt_state"
 fi
 
 tmp_prefix="$(mktemp "$codex_home/.config.prefix.XXXXXX")"
 tmp_candidate="$(mktemp "$codex_home/.config.candidate.XXXXXX")"
 
 if [[ "$mode" == deepseek ]]; then
+  tmp_profile="$(mktemp "$codex_home/.credential-profiles.candidate.XXXXXX")"
+  profile_args=(candidate codex "$codex_home" --output "$tmp_profile")
+  [[ -n "$credential_ref" ]] && profile_args+=(--credential "$credential_ref")
+  credential_info="$($profiles_tool "${profile_args[@]}")"
+  IFS=$'\t' read -r selected_profile_id selected_profile_name <<< "$credential_info"
   print 'model = "deepseek-v4-pro"' > "$tmp_prefix"
   print 'model_provider = "deepseek"' >> "$tmp_prefix"
   print "model_catalog_json = \"$catalog_file\"" >> "$tmp_prefix"
@@ -225,6 +288,46 @@ awk -v prefix_file="$tmp_prefix" '
 ' "$config_file" > "$tmp_candidate"
 chmod 600 "$tmp_candidate"
 
+current_status="$(show_status)"
+current_state="$(print -r -- "$current_status" | awk -F= '$1 == "current_state" { print $2 }')"
+current_profile_id="$(print -r -- "$current_status" | awk -F= '$1 == "credential_profile_id" { print $2 }')"
+if [[ "$mode" == chatgpt && "$current_state" == chatgpt ]]; then
+  switch_committed=1
+  print "ChatGPT/OpenAI is already active; no files changed."
+  print -r -- "$current_status"
+  exit 0
+fi
+if [[ "$mode" == deepseek && "$current_state" == deepseek && "$current_profile_id" == "$selected_profile_id" ]]; then
+  switch_committed=1
+  print "DeepSeek V4 Pro with Credential Profile $selected_profile_name is already active; no files changed."
+  print -r -- "$current_status"
+  exit 0
+fi
+
+mkdir -p "$backup_dir"
+chmod 700 "$backup_dir"
+stamp="$(date '+%Y%m%d-%H%M%S')-$$"
+config_backup="$backup_dir/config.toml.$stamp.before-$mode.bak"
+cp -p "$config_file" "$config_backup"
+
+if [[ "$mode" == deepseek ]]; then
+  if [[ -f "$profile_file" ]]; then
+    profile_existed=1
+    profile_backup="$backup_dir/deepseek-credential-profiles.json.$stamp.before-$mode.bak"
+    cp -p "$profile_file" "$profile_backup"
+  fi
+  if [[ -n "$tmp_chatgpt_state" && -f "$chatgpt_state" ]]; then
+    chatgpt_state_existed=1
+    chatgpt_state_backup="$backup_dir/chatgpt.activation.toml.$stamp.before-$mode.bak"
+    cp -p "$chatgpt_state" "$chatgpt_state_backup"
+  fi
+  mv -f "$tmp_profile" "$profile_file"
+  tmp_profile=""
+  chmod 600 "$profile_file"
+  fsync_directory "${profile_file:h}"
+  profile_applied=1
+fi
+
 verify_home="$(mktemp -d "${TMPDIR:-/tmp}/codex-provider-verify.XXXXXX")"
 cp "$tmp_candidate" "$verify_home/config.toml"
 CODEX_HOME="$verify_home" "$codex_bin" debug models >/dev/null
@@ -234,9 +337,18 @@ if [[ "$mode" == deepseek ]]; then
   health_summary="$(check_upstream)"
 fi
 
+if [[ -n "$tmp_chatgpt_state" ]]; then
+  mv -f "$tmp_chatgpt_state" "$chatgpt_state"
+  tmp_chatgpt_state=""
+  chmod 600 "$chatgpt_state"
+  fsync_directory "${chatgpt_state:h}"
+  chatgpt_state_applied=1
+fi
+
 mv -f "$tmp_candidate" "$config_file"
 tmp_candidate=""
 chmod 600 "$config_file"
+fsync_directory "${config_file:h}"
 config_applied=1
 
 provider_exists || { print -u2 "Post-switch invariant failed: DeepSeek provider disappeared."; exit 1; }
@@ -255,12 +367,19 @@ if [[ "$mode" == deepseek ]]; then
     print -u2 "Codex configuration does not match requested DeepSeek model."
     exit 1
   }
+  verified_profile_id="$(show_status | awk -F= '$1 == "credential_profile_id" { print $2 }')"
+  [[ "$verified_profile_id" == "$selected_profile_id" ]] || {
+    print -u2 "Codex Credential Profile does not match the requested profile."
+    exit 1
+  }
   actual_state="$(show_status | awk -F= '$1 == "current_state" { print $2 }')"
   [[ "$actual_state" == deepseek ]] || {
     print -u2 "Post-switch state is inconsistent: expected deepseek, got ${actual_state:-unknown}."
     exit 1
   }
   print "DeepSeek V4 Pro is active for new sessions."
+  print "credential_profile_id=$selected_profile_id"
+  print "credential_profile_name=$selected_profile_name"
   print "reasoning_effort_mode=per-request"
   print "reasoning_effort_mapping=high=high,xhigh=max"
   print -r -- "$health_summary"

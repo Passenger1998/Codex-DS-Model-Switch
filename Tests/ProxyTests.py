@@ -256,7 +256,7 @@ class ProxyIntegrationTests(unittest.TestCase):
         cls.upstream_thread.start()
         cls.proxy_port = free_port()
         env = os.environ.copy()
-        env["DEEPSEEK_API_KEY"] = "test-key-never-sent-to-the-internet"
+        env["CODEX_SWITCHER_MOCK_API_KEY"] = "test-key-never-sent-to-the-internet"
         env["DEEPSEEK_UPSTREAM_URL"] = f"http://127.0.0.1:{cls.upstream.server_port}/chat/completions"
         cls.proxy = subprocess.Popen(
             [sys.executable, str(PROXY), "--port", str(cls.proxy_port), "--local-token", TOKEN],
@@ -315,6 +315,11 @@ class ProxyIntegrationTests(unittest.TestCase):
         self.assertEqual(health["upstream_reasoning_effort"], "dynamic")
         self.assertEqual(health["accepted_codex_reasoning_efforts"], ["high", "xhigh"])
         self.assertEqual(health["reasoning_effort_mapping"], {"high": "high", "xhigh": "max"})
+        self.assertEqual(health["credential_profile_id"], "environment")
+        self.assertEqual(health["credential_profile_name"], "Environment override")
+        self.assertTrue(health["credential_key_present"])
+        self.assertTrue(health["credential_profile_valid"])
+        self.assertNotIn("test-key-never-sent-to-the-internet", json.dumps(health))
         self.assertIn(health["last_request_codex_reasoning_effort"], {None, "high", "xhigh"})
         self.assertIn(health["last_request_upstream_reasoning_effort"], {None, "high", "max"})
         self.assertIn(
@@ -365,6 +370,98 @@ class ProxyIntegrationTests(unittest.TestCase):
         self.assertEqual((local_host, local_port), ("127.0.0.1", 4878))
         disabled = PROXY_MODULE.parse_macos_proxy_settings("HTTPEnable : 0\nHTTPSEnable : 0")
         self.assertEqual(disabled.route_name, "direct connection")
+
+    def test_credential_provider_reads_active_profile_for_every_request(self) -> None:
+        class FakeCredentials(PROXY_MODULE.CredentialProvider):
+            keys = {"profile-a": "fixture-key-a", "profile-b": "fixture-key-b"}
+
+            def _keychain_result(self, account: str, *, password: bool) -> subprocess.CompletedProcess[str]:
+                key = self.keys.get(account, "")
+                return subprocess.CompletedProcess(
+                    ["security"],
+                    0 if key else 44,
+                    stdout=key + "\n" if password and key else "",
+                    stderr="",
+                )
+
+        with tempfile.TemporaryDirectory(prefix="proxy-profile-tests-") as temporary:
+            profiles = Path(temporary) / "deepseek-credential-profiles.json"
+
+            def activate(profile_id: str) -> None:
+                profiles.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "profiles": [
+                                {"id": "profile-a", "displayName": "Personal"},
+                                {"id": "profile-b", "displayName": "Work"},
+                            ],
+                            "activeProfileId": profile_id,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            activate("profile-a")
+            credentials = FakeCredentials("codex-deepseek-api-key", profiles)
+            self.assertEqual(credentials.get(), "fixture-key-a")
+            self.assertEqual(credentials.status()["name"], "Personal")
+            activate("profile-b")
+            self.assertEqual(credentials.get(), "fixture-key-b")
+            self.assertEqual(credentials.status()["name"], "Work")
+
+    def test_credential_provider_maps_service_only_legacy_key_to_default(self) -> None:
+        class LegacyCredentials(PROXY_MODULE.CredentialProvider):
+            def _keychain_result(
+                self, account: str | None, *, password: bool
+            ) -> subprocess.CompletedProcess[str]:
+                key = "fixture-legacy-key" if account is None else ""
+                return subprocess.CompletedProcess(
+                    ["security"],
+                    0 if key else 44,
+                    stdout=key + "\n" if password and key else "",
+                    stderr="",
+                )
+
+        with tempfile.TemporaryDirectory(prefix="proxy-legacy-profile-tests-") as temporary:
+            profiles = Path(temporary) / "deepseek-credential-profiles.json"
+            credentials = LegacyCredentials("codex-deepseek-api-key", profiles)
+            self.assertEqual(credentials.profile(), {"id": "deepseek", "displayName": "Default"})
+            self.assertEqual(credentials.get(), "fixture-legacy-key")
+            self.assertEqual(credentials.status()["key"], "present")
+
+    def test_service_only_legacy_fallback_cannot_mask_missing_key_in_multiple_profiles(self) -> None:
+        class LegacyCredentials(PROXY_MODULE.CredentialProvider):
+            def _keychain_result(
+                self, account: str | None, *, password: bool
+            ) -> subprocess.CompletedProcess[str]:
+                key = "fixture-legacy-key" if account is None else ""
+                return subprocess.CompletedProcess(
+                    ["security"],
+                    0 if key else 44,
+                    stdout=key + "\n" if password and key else "",
+                    stderr="",
+                )
+
+        with tempfile.TemporaryDirectory(prefix="proxy-multiple-profile-tests-") as temporary:
+            profiles = Path(temporary) / "deepseek-credential-profiles.json"
+            profiles.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "profiles": [
+                            {"id": "deepseek", "displayName": "Default"},
+                            {"id": "profile-b", "displayName": "Work"},
+                        ],
+                        "activeProfileId": "deepseek",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            credentials = LegacyCredentials("codex-deepseek-api-key", profiles)
+            self.assertEqual(credentials.status()["key"], "missing")
+            with self.assertRaisesRegex(RuntimeError, "has no Keychain item"):
+                credentials.get()
 
     def test_direct_dns_failure_has_a_separate_fast_timeout(self) -> None:
         def stalled_resolver(*_args: Any, **_kwargs: Any) -> None:
@@ -689,7 +786,7 @@ refresh_interval_ms = 0
 
         max_proxy_port = free_port()
         proxy_env = os.environ.copy()
-        proxy_env["DEEPSEEK_API_KEY"] = "test-key-never-sent-to-the-internet"
+        proxy_env["CODEX_SWITCHER_MOCK_API_KEY"] = "test-key-never-sent-to-the-internet"
         proxy_env["DEEPSEEK_UPSTREAM_URL"] = f"http://127.0.0.1:{self.upstream.server_port}/chat/completions"
         max_proxy = subprocess.Popen(
             [

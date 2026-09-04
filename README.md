@@ -6,7 +6,7 @@
 - Codex：ChatGPT / DeepSeek V4 Pro
 - Claude Code：Claude 官方 / DeepSeek V4 Pro / DeepSeek V4 Flash
 
-当前版本：**2.1.0（build 12）**，最低系统 macOS 13。
+当前版本：**2.2.1（build 14）**，最低系统 macOS 13。
 
 ## Claude Desktop 的真实配置来源
 
@@ -69,33 +69,54 @@ ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5
 切换时还会读取当前 macOS `scutil --proxy` 的已启用 HTTP/HTTPS 代理，写入
 `HTTP_PROXY` / `HTTPS_PROXY`。切回官方时恢复原值。
 
-## 凭据隔离
+## Credential Profiles 与凭据隔离
 
-Claude 使用独立 Keychain service：
+Codex 和 Claude Code 可以分别保存多组 DeepSeek Credential Profile。
+Profile 与 Pro / Flash 模型独立，每组凭据使用不依赖显示名的稳定 ID。
+两个工具的 Keychain service 仍彼此隔离：
 
 ```text
-service: claude-code-deepseek-api-key
-account: deepseek
+Codex:       service=codex-deepseek-api-key,        account=<profile-id>
+Claude Code: service=claude-code-deepseek-api-key,  account=<profile-id>
 ```
 
-Codex 继续使用 `codex-deepseek-api-key`，两者互不影响。Claude 配置中只保存
-Helper 路径：
+非敏感元数据分别保存在：
+
+```text
+~/.codex/deepseek-credential-profiles.json
+~/.claude/deepseek-credential-profiles.json
+```
+
+元数据只包含 `id`、`displayName`、`activeProfileId` 和 schema 版本。
+真实 API Key 只存在 macOS Keychain。Claude 配置中仍只保存 Helper 路径：
 
 ```text
 ~/.claude/deepseek-keychain-helper
 ```
 
-API Key 不写入 JSON、源码或日志。Provider 的状态检查只查询 Keychain 条目是否
-存在，不请求 `-w`，因此不会把 Key 读进切换器进程。真正请求模型时由 Claude
-执行 Helper 并读取 Keychain。
+API Key 不写入 TOML、JSON、plist、备份、snapshot 或日志。Provider 状态检查
+只查询当前 Profile 的 Keychain 条目是否存在，不请求密码。真正请求时：
 
-首次保存 Claude Key（切换器不会代用户执行）：
+- Codex Responses Proxy 每次请求重新读取当前 Profile ID，因此切换后无需重装或重启代理；
+- Claude Desktop / CLI 每次执行 Helper 时重新读取当前 Profile ID。
+
+旧版 `account=deepseek` 单 Key 会自动映射为 `Default` Profile。旧 Key 不会被删除，
+且不会为了迁移将明文写入文件。
+
+GUI 在 DeepSeek 模式下提供 Profile 新建、安全密码输入、Key 替换和删除。
+已有 Key 永远不会回显。正在被 DeepSeek 使用的 Profile 不能删除。
+
+CLI 也可管理 Profile（`add` / `update` 从终端安全输入读取 Key，不把 Key
+放进命令行）：
 
 ```bash
-security add-generic-password \
-  -s claude-code-deepseek-api-key \
-  -a deepseek \
-  -w '你的 DeepSeek API Key'
+CodexModelSwitcher credentials list codex
+CodexModelSwitcher credentials add codex Personal
+CodexModelSwitcher credentials update codex Personal
+CodexModelSwitcher credentials remove codex Personal
+
+CodexModelSwitcher credentials list claude
+CodexModelSwitcher credentials add claude Work
 ```
 
 ## 安全切换事务
@@ -134,11 +155,11 @@ CLI 只修改并校验配置，不自动重启 App：
 "Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher" status
 
 "Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher" codex chatgpt
-"Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher" codex deepseek
+"Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher" codex deepseek --credential Personal
 
 "Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher" claude default
-"Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher" claude deepseek-pro
-"Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher" claude deepseek-flash
+"Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher" claude deepseek-pro --credential Work
+"Codex 模型切换器.app/Contents/MacOS/CodexModelSwitcher" claude deepseek-flash --credential Personal
 ```
 
 兼容旧命令 `chatgpt` / `deepseek` 保持不变，它们仍分别等价于
@@ -152,10 +173,10 @@ CLI 只修改并校验配置，不自动重启 App：
 ./verify.sh
 ```
 
-`install.sh` 会在目标不存在时把 Claude Helper 安装到
-`~/.claude/deepseek-keychain-helper`（已有 Helper 保持不变），并把 Provider 管理命令安装到
-`~/.codex/bin/claude-provider`。该路径只用于放置切换命令，不会复用 Codex 的
-DeepSeek Keychain service。
+`install.sh` 会安装/更新受管 Claude Helper
+`~/.claude/deepseek-keychain-helper`（用户自定义 Helper 保持不变），并把 Provider 与
+非敏感 Profile 解析工具安装到 `~/.codex/bin`。该路径只用于放置切换命令，
+不会复用 Codex 的 DeepSeek Keychain service。
 
 `verify.sh` 的 Claude 测试全部在临时目录中运行，Keychain 与 App 检测被替身
 替换，不发送真实模型请求。测试覆盖：
@@ -167,6 +188,9 @@ DeepSeek Keychain service。
 - 完整官方快照、无关字段保留、幂等、写后校验与失败回滚；
 - `settings.json` 单层配置不能冒充 Desktop 成功；
 - Claude/Codex Keychain service 隔离；
+- Codex/Claude Profile A → B 切换与 Pro/Flash 独立组合；
+- Profile 缺失、Keychain 条目缺失、活动 Profile 删除拦截与旧版迁移；
+- Keychain 写入失败不修改元数据，重复切换幂等；
 - 不持久化 API Key 或 `ANTHROPIC_AUTH_TOKEN`。
 
 本地自动化测试不会证明真实上游路由。真实端到端验证必须结合 Claude-3p 日志、
@@ -176,11 +200,13 @@ DeepSeek Keychain service。
 ## 项目结构
 
 ```text
-Sources/CodexModelSwitcher/       Swift GUI、状态解析、App 重启
+Sources/CodexModelSwitcher/       Swift GUI、Keychain/Profile 管理、状态解析
 Support/codex-provider            现有 Codex 切换逻辑（保持兼容）
 Support/claude-provider           Claude Desktop/CLI 事务切换器
 Support/claude-gateway-cred-helper.sh
+Support/credential_profiles.py    共享非敏感 Profile schema/解析工具
 Tests/ClaudeProviderTests.py      Claude 临时目录零成本测试
 Tests/ConfigEditorTests.swift     Swift/Codex 兼容测试
 Tests/ProxyTests.py               Codex 本地模拟上游测试
+Tests/CredentialProfileTests.py   Profile/Codex 事务测试
 ```

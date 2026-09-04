@@ -26,9 +26,13 @@ install -d -m 700 "$codex_home" "$proxy_dir" "$bin_dir" "$log_dir"
 install -d -m 700 "$launch_agents_dir"
 install -d -m 700 "$claude_home" "$claude_bin_dir"
 install -m 700 "$root_dir/Support/deepseek_responses_proxy.py" "$proxy_dir/proxy.py"
+install -m 700 "$root_dir/Support/credential_profiles.py" "$proxy_dir/credential_profiles.py"
 install -m 700 "$root_dir/Support/codex-provider" "$bin_dir/codex-provider"
+install -m 700 "$root_dir/Support/credential_profiles.py" "$bin_dir/credential_profiles.py"
 install -m 700 "$root_dir/Support/claude-provider" "$bin_dir/claude-provider"
-if [[ ! -e "$claude_helper" ]]; then
+# The managed helper contains no credential and is safe to update in place.
+# Preserve a user-managed helper that does not carry our marker.
+if [[ ! -e "$claude_helper" ]] || grep -q "claude-provider: Claude Desktop / direct CLI credential helper" "$claude_helper" 2>/dev/null; then
   install -m 700 "$root_dir/Support/claude-gateway-cred-helper.sh" "$claude_helper"
 fi
 install -m 600 "$root_dir/Support/deepseek.models.json" "$codex_home/deepseek.models.json"

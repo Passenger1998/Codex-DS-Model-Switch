@@ -34,7 +34,8 @@ class ClaudeProviderTests(unittest.TestCase):
         self._original_desktop = MODULE.detect_claude_desktop
         self._original_engine = MODULE.detect_bundled_claude_code
         self._original_cli = MODULE.detect_claude_cli
-        MODULE.keychain_ready = lambda *a, **k: True
+        self.keychain_accounts = {"deepseek", "profile-a", "profile-b"}
+        MODULE.keychain_ready = lambda _service=MODULE.KEYCHAIN_SERVICE, account=MODULE.KEYCHAIN_ACCOUNT: account in self.keychain_accounts
         MODULE.detect_claude_desktop = lambda: (
             True,
             "1.37937.1",
@@ -68,6 +69,10 @@ class ClaudeProviderTests(unittest.TestCase):
 
     def active_path(self, config_id: str = CONFIG_ID) -> Path:
         return MODULE.config_library_entry_path(self.support, config_id)
+
+    @property
+    def profiles_path(self) -> Path:
+        return MODULE.profile_path(self.claude_home)
 
     @staticmethod
     def write_json(path: Path, data: dict[str, Any]) -> None:
@@ -136,8 +141,24 @@ class ClaudeProviderTests(unittest.TestCase):
             MODULE.deepseek_desktop_config({}, mode, str(self.helper)),
         )
 
+    def write_profiles(self, active: str | None = "profile-a") -> None:
+        self.write_json(
+            self.profiles_path,
+            {
+                "version": 1,
+                "profiles": [
+                    {"id": "profile-a", "displayName": "Personal"},
+                    {"id": "profile-b", "displayName": "Work"},
+                ],
+                "activeProfileId": active,
+            },
+        )
+
     def switch(
-        self, mode: str, proxy: dict[str, str] | None = None
+        self,
+        mode: str,
+        proxy: dict[str, str] | None = None,
+        credential_profile: str | None = None,
     ) -> dict[str, str]:
         return MODULE.switch_mode(
             mode,
@@ -145,6 +166,7 @@ class ClaudeProviderTests(unittest.TestCase):
             claude_3p_support=self.support,
             helper_command=str(self.helper),
             proxy_env={} if proxy is None else proxy,
+            credential_profile=credential_profile,
         )
 
     def status_values(self) -> dict[str, str]:
@@ -340,6 +362,78 @@ class ClaudeProviderTests(unittest.TestCase):
             backups_before,
         )
 
+    def test_profile_a_to_b_switch_is_transactional(self) -> None:
+        self.write_official_fixture()
+        self.write_profiles()
+        self.switch("deepseek-pro")
+        self.assertEqual(self.status_values()["credential_profile_id"], "profile-a")
+        active_before = self.active_path().read_bytes()
+        self.switch("deepseek-pro", credential_profile="profile-b")
+        values = self.status_values()
+        self.assertEqual(values["current_state"], "deepseek-pro")
+        self.assertEqual(values["credential_profile_id"], "profile-b")
+        self.assertEqual(values["credential_profile_name"], "Work")
+        self.assertEqual(self.active_path().read_bytes(), active_before)
+
+    def test_pro_flash_and_profiles_are_independent(self) -> None:
+        self.write_official_fixture()
+        self.write_profiles()
+        self.switch("deepseek-pro", credential_profile="profile-b")
+        self.assertEqual(self.status_values()["credential_profile_id"], "profile-b")
+        self.switch("deepseek-flash", credential_profile="profile-a")
+        values = self.status_values()
+        self.assertEqual(values["current_state"], "deepseek-flash")
+        self.assertEqual(values["credential_profile_id"], "profile-a")
+        self.assertEqual(
+            self.read_json(self.active_path())["inferenceModels"][0]["name"],
+            MODULE.FLASH_MODEL,
+        )
+
+    def test_invalid_or_missing_profile_key_never_mutates_configs(self) -> None:
+        self.write_official_fixture()
+        self.write_profiles()
+        tracked = (self.settings_path, self.desktop_path, self.meta_path, self.active_path(), self.profiles_path)
+        before = {path: path.read_bytes() for path in tracked}
+        with self.assertRaisesRegex(MODULE.ClaudeProviderError, "Credential Profile 不存在"):
+            self.switch("deepseek-pro", credential_profile="missing-profile")
+        self.assertEqual(before, {path: path.read_bytes() for path in tracked})
+
+        self.keychain_accounts.remove("profile-b")
+        with self.assertRaisesRegex(MODULE.ClaudeProviderError, "Keychain 条目缺失"):
+            self.switch("deepseek-pro", credential_profile="profile-b")
+        self.assertEqual(before, {path: path.read_bytes() for path in tracked})
+
+    def test_status_explains_missing_active_profile_and_key(self) -> None:
+        self.write_deepseek_fixture("deepseek-pro")
+        self.write_profiles(active="missing-profile")
+        values = self.status_values()
+        self.assertEqual(values["current_state"], "inconsistent")
+        self.assertIn("不存在", values["inconsistency_reason"])
+
+        self.write_profiles(active="profile-b")
+        self.keychain_accounts.remove("profile-b")
+        values = self.status_values()
+        self.assertEqual(values["current_state"], "inconsistent")
+        self.assertIn("Keychain 条目缺失", values["inconsistency_reason"])
+
+    def test_legacy_single_key_is_mapped_without_deletion(self) -> None:
+        self.write_official_fixture()
+        self.assertFalse(self.profiles_path.exists())
+        self.switch("deepseek-pro")
+        state = self.read_json(self.profiles_path)
+        self.assertEqual(state["profiles"], [{"id": "deepseek", "displayName": "Default"}])
+        self.assertEqual(state["activeProfileId"], "deepseek")
+        self.assertIn("deepseek", self.keychain_accounts)
+
+    def test_official_mode_preserves_profiles(self) -> None:
+        self.write_official_fixture()
+        self.write_profiles()
+        self.switch("deepseek-flash", credential_profile="profile-b")
+        profile_bytes = self.profiles_path.read_bytes()
+        self.switch("default")
+        self.assertEqual(self.profiles_path.read_bytes(), profile_bytes)
+        self.assertEqual(self.status_values()["current_state"], "default")
+
     # --- safety / rollback --------------------------------------------
 
     def test_missing_keychain_fails_without_mutation(self) -> None:
@@ -394,6 +488,7 @@ class ClaudeProviderTests(unittest.TestCase):
             self.desktop_path,
             self.meta_path,
             self.active_path(),
+            MODULE.profile_path(self.claude_home),
             MODULE.snapshot_pointer_path(self.claude_home),
         ] + list(MODULE.snapshot_root(self.claude_home).glob("*/*"))
         combined = b"\n".join(path.read_bytes() for path in paths if path.is_file())

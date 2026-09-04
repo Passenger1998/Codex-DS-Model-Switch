@@ -109,6 +109,7 @@ def write_launch_agent(path: Path, proxy_path: Path, log_dir: Path) -> None:
             "--host", "127.0.0.1",
             "--port", "4878",
             "--keychain-service", "codex-deepseek-api-key",
+            "--credential-profiles-file", str(proxy_path.parent.parent / "deepseek-credential-profiles.json"),
             "--local-token", "codex-deepseek-local",
             "--thinking", "enabled",
             "--connect-timeout", "8",

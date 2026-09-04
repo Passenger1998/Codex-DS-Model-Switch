@@ -27,11 +27,22 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from credential_profiles import (
+    DEFAULT_PROFILE_NAME,
+    LEGACY_PROFILE_ID,
+    CredentialProfileError,
+    load_state,
+    migrated_state,
+    resolve_profile,
+)
 
-VERSION = "1.1.5"
+
+VERSION = "1.2.0"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4878
 DEFAULT_UPSTREAM = "https://api.deepseek.com/chat/completions"
@@ -149,6 +160,7 @@ class ProxyConfig:
     stream_idle_timeout: float
     response_timeout: float
     health_read_timeout: float
+    credential_profiles_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -279,7 +291,7 @@ class UpstreamTransport:
     def ensure_resolvable(self, host: str, port: int, route_name: str) -> None:
         cache_key = (host, port)
         with self.resolve_lock:
-            if time.monotonic() - self.resolved.get(cache_key, 0) < 60:
+            if cache_key in self.resolved and time.monotonic() - self.resolved[cache_key] < 60:
                 return
         result_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
 
@@ -336,24 +348,106 @@ class UpstreamTransport:
 
 
 class CredentialProvider:
-    def __init__(self, keychain_service: str):
+    def __init__(self, keychain_service: str, profiles_file: str | Path | None = None):
         self.keychain_service = keychain_service
+        self.profiles_file = Path(profiles_file).expanduser() if profiles_file else None
 
-    def get(self) -> str:
-        environment_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-        if environment_key:
-            return environment_key
-        result = subprocess.run(
-            ["/usr/bin/security", "find-generic-password", "-s", self.keychain_service, "-w"],
+    @staticmethod
+    def _mock_key() -> str:
+        """Allow fake credentials only for the loopback upstream test harness."""
+        upstream = urlsplit(os.environ.get("DEEPSEEK_UPSTREAM_URL", ""))
+        if (upstream.hostname or "").lower() not in LOOPBACK_HOSTS:
+            return ""
+        return os.environ.get("CODEX_SWITCHER_MOCK_API_KEY", "").strip()
+
+    def _keychain_result(self, account: str | None, *, password: bool) -> subprocess.CompletedProcess[str]:
+        command = [
+            "/usr/bin/security",
+            "find-generic-password",
+            "-s",
+            self.keychain_service,
+        ]
+        if account is not None:
+            command += ["-a", account]
+        if password:
+            command.append("-w")
+        return subprocess.run(
+            command,
             check=False,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.PIPE if password else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=5,
         )
+
+    def _exact_key_exists(self, _service: str, account: str) -> bool:
+        try:
+            return self._keychain_result(account, password=False).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _legacy_service_exists(self, _service: str) -> bool:
+        try:
+            return self._keychain_result(None, password=False).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _profile_context(self) -> tuple[dict[str, str], bool]:
+        if self.profiles_file is None:
+            return {"id": LEGACY_PROFILE_ID, "displayName": DEFAULT_PROFILE_NAME}, True
+        state = load_state(self.profiles_file)
+        state, migrated = migrated_state(
+            "codex",
+            state,
+            self._exact_key_exists,
+            self._legacy_service_exists,
+        )
+        profile = resolve_profile(state, str(state.get("activeProfileId") or ""))
+        allow_legacy_service = migrated or (
+            len(state["profiles"]) == 1 and profile["id"] == LEGACY_PROFILE_ID
+        )
+        return profile, allow_legacy_service
+
+    def profile(self) -> dict[str, str]:
+        return self._profile_context()[0]
+
+    def status(self) -> dict[str, str]:
+        if self._mock_key():
+            return {
+                "id": "environment",
+                "name": "Environment override",
+                "key": "present",
+                "valid": "yes",
+                "reason": "",
+            }
+        try:
+            profile, allow_legacy_service = self._profile_context()
+            present = self._exact_key_exists(self.keychain_service, profile["id"])
+            if not present and allow_legacy_service:
+                present = self._legacy_service_exists(self.keychain_service)
+            return {
+                "id": profile["id"],
+                "name": profile["displayName"],
+                "key": "present" if present else "missing",
+                "valid": "yes" if present else "no",
+                "reason": "" if present else f"Credential Profile {profile['displayName']} has no Keychain item",
+            }
+        except CredentialProfileError as exc:
+            return {"id": "", "name": "", "key": "missing", "valid": "no", "reason": str(exc)}
+
+    def get(self) -> str:
+        environment_key = self._mock_key()
+        if environment_key:
+            return environment_key
+        profile, allow_legacy_service = self._profile_context()
+        result = self._keychain_result(profile["id"], password=True)
+        if result.returncode != 0 and allow_legacy_service:
+            result = self._keychain_result(None, password=True)
         key = result.stdout.strip()
         if result.returncode != 0 or not key:
-            raise RuntimeError(f"Keychain item '{self.keychain_service}' is unavailable")
+            raise RuntimeError(
+                f"Credential Profile '{profile['displayName']}' ({profile['id']}) has no Keychain item"
+            )
         return key
 
     def exists(self) -> bool:
@@ -900,6 +994,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path in {"/health", "/v1/health"}:
+            credential = self.app.credentials.status()
             self.send_json(
                 200,
                 {
@@ -917,6 +1012,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "network_route": self.app.adapter.transport.route_name,
                     "connect_timeout_seconds": self.app.config.connect_timeout,
                     "stream_idle_timeout_seconds": self.app.config.stream_idle_timeout,
+                    "credential_profile_id": credential["id"],
+                    "credential_profile_name": credential["name"],
+                    "credential_key_present": credential["key"] == "present",
+                    "credential_profile_valid": credential["valid"] == "yes",
+                    "credential_profile_reason": credential["reason"],
                 },
             )
             return
@@ -1083,7 +1183,9 @@ class ProxyServer(ThreadingHTTPServer):
 
     def __init__(self, config: ProxyConfig):
         self.config = config
-        self.credentials = CredentialProvider(config.keychain_service)
+        self.credentials = CredentialProvider(
+            config.keychain_service, config.credential_profiles_file or None
+        )
         self.adapter = DeepSeekAdapter(config, self.credentials)
         super().__init__((config.host, config.port), ProxyHandler)
 
@@ -1094,6 +1196,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=int(os.environ.get("CODEX_DEEPSEEK_PROXY_PORT", DEFAULT_PORT)))
     parser.add_argument("--upstream-url", default=os.environ.get("DEEPSEEK_UPSTREAM_URL", DEFAULT_UPSTREAM))
     parser.add_argument("--keychain-service", default=os.environ.get("DEEPSEEK_KEYCHAIN_SERVICE", DEFAULT_KEYCHAIN_SERVICE))
+    parser.add_argument(
+        "--credential-profiles-file",
+        default=os.environ.get(
+            "DEEPSEEK_CREDENTIAL_PROFILES_FILE",
+            str(Path.home() / ".codex/deepseek-credential-profiles.json"),
+        ),
+    )
     parser.add_argument("--local-token", default=os.environ.get("CODEX_DEEPSEEK_LOCAL_TOKEN", DEFAULT_LOCAL_TOKEN))
     parser.add_argument("--thinking", choices=("enabled", "disabled"), default=os.environ.get("DEEPSEEK_THINKING", "enabled"))
     parser.add_argument(
@@ -1145,11 +1254,19 @@ def main(argv: list[str] | None = None) -> int:
         stream_idle_timeout=args.stream_idle_timeout,
         response_timeout=args.response_timeout,
         health_read_timeout=args.health_read_timeout,
+        credential_profiles_file=args.credential_profiles_file,
     )
-    credentials = CredentialProvider(config.keychain_service)
+    credentials = CredentialProvider(
+        config.keychain_service, config.credential_profiles_file or None
+    )
     if args.check_config:
-        if not credentials.exists():
-            print(f"Missing Keychain item: {config.keychain_service}", file=sys.stderr)
+        credential = credentials.status()
+        if credential["valid"] != "yes":
+            print(
+                credential["reason"]
+                or f"Missing Keychain item: {config.keychain_service}",
+                file=sys.stderr,
+            )
             return 1
         print("configuration=ok")
         return 0

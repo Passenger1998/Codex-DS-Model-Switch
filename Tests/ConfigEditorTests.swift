@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 enum TestFailure: Error, CustomStringConvertible {
     case failed(String)
@@ -37,21 +38,21 @@ struct ConfigEditorTests {
         defer { try? fileManager.removeItem(at: directory) }
 
         let executable = directory.appendingPathComponent("codex-provider")
-        try writeExecutable("#!/bin/sh\nprintf 'mode=%s\\n' \"$1\"\n", to: executable)
+        try writeExecutable("#!/bin/sh\nprintf 'args=%s\\n' \"$*\"\n", to: executable)
         let command = CodexProviderCommand(
             codexDirectory: directory,
             executableURL: executable
         )
 
-        let deepSeekResult = try command.switchMode(to: .deepSeek)
+        let deepSeekResult = try command.switchMode(to: .deepSeek, credentialProfileID: "profile-a")
         let chatGPTResult = try command.switchMode(to: .chatGPT)
         let statusResult = try command.status()
 
-        try expect(deepSeekResult.output == "mode=deepseek",
+        try expect(deepSeekResult.output == "args=deepseek --credential profile-a",
                    "DeepSeek 参数传递错误")
-        try expect(chatGPTResult.output == "mode=chatgpt",
+        try expect(chatGPTResult.output == "args=chatgpt",
                    "ChatGPT 参数传递错误")
-        try expect(statusResult.output == "mode=status",
+        try expect(statusResult.output == "args=status",
                    "status 参数传递错误")
     }
 
@@ -60,6 +61,9 @@ struct ConfigEditorTests {
         current_state=deepseek
         state_label=DeepSeek V4 Pro
         state_consistent=yes
+        credential_profile_id=profile-a
+        credential_profile_name=Personal
+        credential_profile_key=present
         """)
         let inconsistent = ProviderStatus(output: """
         current_state=inconsistent
@@ -70,6 +74,9 @@ struct ConfigEditorTests {
         try expect(deepSeek.currentMode == .deepSeek, "DeepSeek 实际状态解析错误")
         try expect(deepSeek.displayName == "DeepSeek V4 Pro", "DeepSeek 显示状态错误")
         try expect(deepSeek.isConsistent, "DeepSeek 应标记为一致")
+        try expect(deepSeek.credentialProfileID == "profile-a", "Credential Profile ID 解析错误")
+        try expect(deepSeek.credentialProfileName == "Personal", "Credential Profile 名称解析错误")
+        try expect(deepSeek.credentialKeyPresent, "Credential Profile Key 应存在")
         try expect(inconsistent.currentMode == nil, "不一致状态不应映射为可选模式")
         try expect(!inconsistent.isConsistent, "不一致状态应被识别")
     }
@@ -127,6 +134,134 @@ struct ConfigEditorTests {
             try expect(status == 7, "错误退出码未保留")
             try expect(message == "safe failure", "错误详情未保留")
         }
+    }
+
+    final class FakeKeychain: CredentialKeychainAccess {
+        var values: [String: String] = [:]
+        var failStore = false
+        var failRemove = false
+
+        private func key(_ service: String, _ account: String) -> String {
+            "\(service)|\(account)"
+        }
+
+        func contains(service: String, account: String) -> Bool {
+            values[key(service, account)] != nil
+        }
+
+        func ensureLegacyAccount(service: String, targetAccount: String) throws -> Bool {
+            if contains(service: service, account: targetAccount) { return true }
+            guard let legacy = values.first(where: { $0.key.hasPrefix("\(service)|") })?.value else {
+                return false
+            }
+            values[key(service, targetAccount)] = legacy
+            return true
+        }
+
+        func store(_ secret: String, service: String, account: String) throws {
+            if failStore { throw CredentialProfileError.keychain(errSecAuthFailed) }
+            values[key(service, account)] = secret
+        }
+
+        func remove(service: String, account: String) throws {
+            if failRemove { throw CredentialProfileError.keychain(errSecAuthFailed) }
+            values.removeValue(forKey: key(service, account))
+        }
+    }
+
+    static func testCredentialProfileCreationEnumerationAndSecretIsolation() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: directory) }
+        let keychain = FakeKeychain()
+        let store = CredentialProfileStore(
+            scope: .codex,
+            homeDirectory: directory,
+            keychain: keychain
+        )
+        let personal = try store.create(displayName: "Personal", apiKey: "fixture-secret-personal")
+        let work = try store.create(displayName: "Work", apiKey: "fixture-secret-work")
+        let profiles = try store.profiles()
+        try expect(profiles == [personal, work], "多 Profile 创建或枚举错误")
+        try expect(personal.id != work.id, "Profile 必须使用独立稳定 ID")
+        let metadata = try String(contentsOf: store.metadataURL, encoding: .utf8)
+        try expect(!metadata.contains("fixture-secret"), "Profile 元数据不得包含 API Key")
+        try expect(store.keyExists(for: personal), "Personal Keychain 条目应存在")
+        try expect(store.keyExists(for: work), "Work Keychain 条目应存在")
+    }
+
+    static func testCredentialKeychainFailureDoesNotMutateMetadata() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: directory) }
+        let keychain = FakeKeychain()
+        let store = CredentialProfileStore(
+            scope: .claude,
+            homeDirectory: directory,
+            keychain: keychain
+        )
+        _ = try store.create(displayName: "Personal", apiKey: "fixture-one")
+        let before = try Data(contentsOf: store.metadataURL)
+        keychain.failStore = true
+        do {
+            _ = try store.create(displayName: "Work", apiKey: "fixture-two")
+            throw TestFailure.failed("Keychain 写入失败时不应创建 Profile")
+        } catch CredentialProfileError.keychain {
+            // Expected.
+        }
+        let after = try Data(contentsOf: store.metadataURL)
+        try expect(after == before,
+                   "Keychain 写入失败后 Profile 元数据应保持不变")
+    }
+
+    static func testLegacyMigrationAndActiveDeletionGuard() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: directory) }
+        let keychain = FakeKeychain()
+        keychain.values["codex-deepseek-api-key|old-account"] = "legacy-fixture-secret"
+        let store = CredentialProfileStore(
+            scope: .codex,
+            homeDirectory: directory,
+            keychain: keychain
+        )
+        try store.ensureLegacyMigration()
+        let migrated = try store.state()
+        try expect(migrated.profiles == [CredentialProfile(id: "deepseek", displayName: "Default")],
+                   "旧版单 Key 应映射为 Default Profile")
+        try expect(migrated.activeProfileId == "deepseek", "Default Profile 应保持活动")
+        guard let active = migrated.profiles.first else {
+            throw TestFailure.failed("缺少迁移后 Profile")
+        }
+        do {
+            try store.remove(active, currentlyUsed: { true })
+            throw TestFailure.failed("不应删除正在使用的 Profile")
+        } catch CredentialProfileError.activeProfileCannotBeDeleted {
+            // Expected.
+        }
+        try expect(keychain.contains(service: "codex-deepseek-api-key", account: "deepseek"),
+                   "旧 service-only Key 应复制到 Default Profile account")
+        try expect(keychain.contains(service: "codex-deepseek-api-key", account: "old-account"),
+                   "迁移和拦截删除不得破坏旧 Key")
+    }
+
+    static func testCredentialDeleteFailureRollsMetadataBack() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? fileManager.removeItem(at: directory) }
+        let keychain = FakeKeychain()
+        let store = CredentialProfileStore(
+            scope: .claude,
+            homeDirectory: directory,
+            keychain: keychain
+        )
+        let profile = try store.create(displayName: "Backup", apiKey: "fixture-backup")
+        let before = try Data(contentsOf: store.metadataURL)
+        keychain.failRemove = true
+        do {
+            try store.remove(profile, currentlyUsed: { false })
+            throw TestFailure.failed("Keychain 删除失败时不应完成 Profile 删除")
+        } catch CredentialProfileError.keychain {
+            // Expected.
+        }
+        let after = try Data(contentsOf: store.metadataURL)
+        try expect(after == before, "Keychain 删除失败后元数据应回滚")
     }
 
     final class FakeApplication: CodexApplicationProcess {
@@ -266,10 +401,15 @@ struct ConfigEditorTests {
         try testCodexDirectoryOverride()
         try testMissingExecutableGuard()
         try testCommandFailureIsSurfaced()
+        try testCredentialProfileCreationEnumerationAndSecretIsolation()
+        try testCredentialKeychainFailureDoesNotMutateMetadata()
+        try testLegacyMigrationAndActiveDeletionGuard()
+        try testCredentialDeleteFailureRollsMetadataBack()
         try testRunningCodexIsTerminatedAndRelaunched()
         try testHungCodexUsesForceTerminateFallback()
         try testStoppedCodexIsOpened()
         print("ConfigEditorTests: PASS")
         try ClaudeProviderTests.run()
+        try CredentialInputViewTests.run()
     }
 }

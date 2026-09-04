@@ -44,6 +44,9 @@ enum ClaudeProviderTests {
         deployment_mode=3p
         helper_ready=yes
         auth=keychain-helper
+        credential_profile_id=profile-b
+        credential_profile_name=Work
+        credential_profile_key=present
         """)
         let inconsistent = ClaudeStatus(output: """
         current_state=inconsistent
@@ -72,6 +75,9 @@ enum ClaudeProviderTests {
         try expect(pro.desktopDefaultModel == "claude-opus-5", "desktopDefaultModel 解析错误")
         try expect(pro.deploymentMode == "3p", "deploymentMode 解析错误")
         try expect(pro.helperReady, "helperReady 应为 true")
+        try expect(pro.credentialProfileID == "profile-b", "Claude Credential Profile ID 解析错误")
+        try expect(pro.credentialProfileName == "Work", "Claude Credential Profile 名称解析错误")
+        try expect(pro.credentialKeyPresent, "Claude Credential Profile Key 应存在")
 
         try expect(inconsistent.currentMode == nil, "不一致状态不应映射为可选模式")
         try expect(!inconsistent.isConsistent, "不一致状态应被识别")
@@ -87,21 +93,21 @@ enum ClaudeProviderTests {
         defer { try? fileManager.removeItem(at: directory) }
 
         let executable = directory.appendingPathComponent("claude-provider")
-        try writeExecutable("#!/bin/sh\nprintf 'mode=%s\\n' \"$1\"\n", to: executable)
+        try writeExecutable("#!/bin/sh\nprintf 'args=%s\\n' \"$*\"\n", to: executable)
         let command = ClaudeProviderCommand(
             codexDirectory: directory,
             executableURL: executable
         )
 
         let defaultResult = try command.switchMode(to: .official)
-        let proResult = try command.switchMode(to: .deepSeekPro)
-        let flashResult = try command.switchMode(to: .deepSeekFlash)
+        let proResult = try command.switchMode(to: .deepSeekPro, credentialProfileID: "profile-a")
+        let flashResult = try command.switchMode(to: .deepSeekFlash, credentialProfileID: "profile-b")
         let statusResult = try command.status()
 
-        try expect(defaultResult.output == "mode=default", "Claude 官方参数传递错误")
-        try expect(proResult.output == "mode=deepseek-pro", "DeepSeek Pro 参数传递错误")
-        try expect(flashResult.output == "mode=deepseek-flash", "DeepSeek Flash 参数传递错误")
-        try expect(statusResult.output == "mode=status", "status 参数传递错误")
+        try expect(defaultResult.output == "args=default", "Claude 官方参数传递错误")
+        try expect(proResult.output == "args=deepseek-pro --credential profile-a", "DeepSeek Pro 参数传递错误")
+        try expect(flashResult.output == "args=deepseek-flash --credential profile-b", "DeepSeek Flash 参数传递错误")
+        try expect(statusResult.output == "args=status", "status 参数传递错误")
     }
 
     static func testClaudeDirectoryOverride() throws {

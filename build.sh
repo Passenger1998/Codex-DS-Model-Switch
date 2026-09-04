@@ -18,6 +18,7 @@ TEST_BINARY="$BUILD_ROOT/ConfigEditorTests"
 
 PYTHONPYCACHEPREFIX="$BUILD_ROOT/pycache" /usr/bin/python3 -m py_compile \
   "$ROOT_DIR/Support/deepseek_responses_proxy.py" \
+  "$ROOT_DIR/Support/credential_profiles.py" \
   "$ROOT_DIR/Support/install_config.py" \
   "$ROOT_DIR/Support/claude-provider" \
   "$ROOT_DIR/Tests/ClaudeProviderTests.py"
@@ -65,11 +66,15 @@ swiftc -swift-version 5 -O \
   -target "$SWIFT_TARGET" \
   -sdk "$SDK_PATH" \
   -framework AppKit \
+  -framework Security \
   -o "$TEST_BINARY" \
   "$ROOT_DIR/Sources/CodexModelSwitcher/ConfigEditor.swift" \
+  "$ROOT_DIR/Sources/CodexModelSwitcher/CredentialProfiles.swift" \
+  "$ROOT_DIR/Sources/CodexModelSwitcher/CredentialInputView.swift" \
   "$ROOT_DIR/Sources/CodexModelSwitcher/CodexAppRestarter.swift" \
   "$ROOT_DIR/Tests/ConfigEditorTests.swift" \
-  "$ROOT_DIR/Tests/ClaudeProviderTests.swift"
+  "$ROOT_DIR/Tests/ClaudeProviderTests.swift" \
+  "$ROOT_DIR/Tests/CredentialInputViewTests.swift"
 
 "$TEST_BINARY"
 
@@ -79,8 +84,11 @@ swiftc -swift-version 5 -O \
   -target "$SWIFT_TARGET" \
   -sdk "$SDK_PATH" \
   -framework AppKit \
+  -framework Security \
   -o "$MACOS_DIR/CodexModelSwitcher" \
   "$ROOT_DIR/Sources/CodexModelSwitcher/ConfigEditor.swift" \
+  "$ROOT_DIR/Sources/CodexModelSwitcher/CredentialProfiles.swift" \
+  "$ROOT_DIR/Sources/CodexModelSwitcher/CredentialInputView.swift" \
   "$ROOT_DIR/Sources/CodexModelSwitcher/CodexAppRestarter.swift" \
   "$ROOT_DIR/Sources/CodexModelSwitcher/main.swift"
 
@@ -88,6 +96,7 @@ cp "$ROOT_DIR/Sources/CodexModelSwitcher/Info.plist" "$CONTENTS_DIR/Info.plist"
 mkdir -p "$CONTENTS_DIR/Resources"
 cp "$ROOT_DIR/Sources/CodexModelSwitcher/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
 install -m 700 "$ROOT_DIR/Support/claude-provider" "$CONTENTS_DIR/Resources/claude-provider"
+install -m 700 "$ROOT_DIR/Support/credential_profiles.py" "$CONTENTS_DIR/Resources/credential_profiles.py"
 printf 'APPL????' > "$CONTENTS_DIR/PkgInfo"
 
 xattr -cr "$STAGED_APP_DIR"
